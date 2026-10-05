@@ -49,6 +49,14 @@ class TeachableDownloader:
             return False
         return True
 
+    def bypass_cloudflare_if_present(self):
+        if self.check_elem_exists(
+            By.ID, "challenge-stage", timeout=self.global_timeout
+        ):
+            self.bypass_cloudflare()
+        else:
+            logger.info("No need to bypass cloudflare")
+
     def bypass_cloudflare(self):
         if self.driver.capabilities["browserVersion"].split(".")[0] < "115":
             return
@@ -112,12 +120,7 @@ class TeachableDownloader:
     def login(self, email, password):
         logger.info("Logging in")
 
-        if self.check_elem_exists(
-            By.ID, "challenge-stage", timeout=self.global_timeout
-        ):
-            self.bypass_cloudflare()
-        else:
-            logger.info("No need to bypass cloudflare")
+        self.bypass_cloudflare_if_present()
 
         WebDriverWait(self.driver, timeout=15).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
@@ -231,12 +234,7 @@ class TeachableDownloader:
         if self.driver.current_url != course_url:
             logger.info("Switching to course page")
             self.driver.get(course_url)
-            if self.check_elem_exists(
-                By.ID, "challenge-stage", timeout=self.global_timeout
-            ):
-                self.bypass_cloudflare()
-            else:
-                logger.info("No need to bypass cloudflare")
+            self.bypass_cloudflare_if_present()
 
         WebDriverWait(self.driver, timeout=self.global_timeout).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
