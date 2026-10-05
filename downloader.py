@@ -259,7 +259,9 @@ class TeachableDownloader:
 
     def download_course_colossal(self, course_url):
         logger.info("Detected block course format")
-        course_title = self.get_course_title_colossal(course_url)
+        course_title = self.get_course_title(
+            course_url, By.CSS_SELECTOR, ".course__title"
+        )
         course_path = create_folder(course_title)
 
         self.save_course_html(course_path)
@@ -322,7 +324,11 @@ class TeachableDownloader:
 
     def download_course_classic(self, course_url):
         logger.info("Detected _mainbar course format")
-        course_title = self.get_course_title_classic(course_url)
+        course_title = self.get_course_title(
+            course_url,
+            By.CSS_SELECTOR,
+            "body > section > div.course-sidebar > div > h2",
+        )
         course_path = create_folder(course_title)
 
         self.save_course_html(course_path)
@@ -419,38 +425,14 @@ class TeachableDownloader:
 
         self.download_videos_from_links(video_list)
 
-    def get_course_title_colossal(self, course_url):
+    def get_course_title(self, course_url, by, selector):
         if self.driver.current_url != course_url:
             self.driver.get(course_url)
         try:
             logger.info("Getting course title")
             course_title = (
                 WebDriverWait(self.driver, self.global_timeout)
-                .until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".course__title"))
-                )
-                .text
-            )
-        except Exception:
-            logger.warning("Could not get course title, using tab title instead")
-            course_title = self.driver.title
-        return clean_string(course_title)
-
-    def get_course_title_classic(self, course_url):
-        if self.driver.current_url != course_url:
-            self.driver.get(course_url)
-        try:
-            logger.info("Getting course title")
-            course_title = (
-                WebDriverWait(self.driver, self.global_timeout)
-                .until(
-                    EC.presence_of_element_located(
-                        (
-                            By.CSS_SELECTOR,
-                            "body > section > div.course-sidebar > div > h2",
-                        )
-                    )
-                )
+                .until(EC.presence_of_element_located((by, selector)))
                 .text
             )
         except Exception:
@@ -470,6 +452,18 @@ class TeachableDownloader:
         course_title = heading.text
         return clean_string(course_title)
 
+    def save_course_image(self, course_path, image_src):
+        response = requests.get(image_src, timeout=30)
+        if response.ok:
+            # save the image to disk
+            image_path = os.path.join(course_path, "course-image.jpg")
+            with open(image_path, "wb") as f:
+                f.write(response.content)
+            logger.info("Image downloaded successfully.")
+        else:
+            # print a message indicating that the image download failed
+            logger.warning("Failed to download image.")
+
     def get_course_image_classic(self, course_path):
         image_element = self.driver.find_elements(By.CLASS_NAME, "course-image")
 
@@ -480,19 +474,9 @@ class TeachableDownloader:
         try:
             logger.info("Found course image")
             image_src = image_element[0].get_attribute("src")
-            image_src_hd = re.sub(r"/resize=.+?/", "/", image_src)
-
             # try to download the image using the modified link first
-            response = requests.get(image_src_hd, timeout=30)
-            if response.ok:
-                # save the image to disk
-                image_path = os.path.join(course_path, "course-image.jpg")
-                with open(image_path, "wb") as f:
-                    f.write(response.content)
-                logger.info("Image downloaded successfully.")
-            else:
-                # print a message indicating that the image download failed
-                logger.warning("Failed to download image.")
+            image_src_hd = re.sub(r"/resize=.+?/", "/", image_src)
+            self.save_course_image(course_path, image_src_hd)
         except Exception as e:
             logger.warning("Could not find course image: " + str(e))
 
@@ -508,18 +492,7 @@ class TeachableDownloader:
         try:
             logger.info("Found course image")
             image_src = image_element[0].get_attribute("src")
-
-            # try to download the image using the modified link first
-            response = requests.get(image_src, timeout=30)
-            if response.ok:
-                # save the image to disk
-                image_path = os.path.join(course_path, "course-image.jpg")
-                with open(image_path, "wb") as f:
-                    f.write(response.content)
-                logger.info("Image downloaded successfully.")
-            else:
-                # print a message indicating that the image download failed
-                logger.warning("Failed to download image.")
+            self.save_course_image(course_path, image_src)
         except Exception as e:
             logger.warning("Could not find course image: " + str(e))
 
@@ -766,6 +739,7 @@ class TeachableDownloader:
             logger.warning(
                 "Could not download subtitle: " + title + " cause: " + str(e)
             )
+            return
 
         subtitle_links = {}
         for lang, sub_info in info_json["requested_subtitles"].items():
@@ -775,7 +749,6 @@ class TeachableDownloader:
             }
 
         # Print the subtitle links and language names
-        req = None
         for lang, sub in subtitle_links.items():
             subtitle_filename = "{:02d}-{}.{}.{}".format(idx, title, lang, sub["ext"])
             file_path = os.path.join(output_path, subtitle_filename)
@@ -784,22 +757,24 @@ class TeachableDownloader:
             else:
                 base_url = sub["url"]
                 try:
-                    req = requests.get(sub["url"], headers=self.headers)
+                    req = requests.get(sub["url"], headers=self.headers, timeout=30)
                 except Exception as e:
                     logger.warning(
                         "Could not download subtitle: " + title + " cause: " + str(e)
                     )
+                    continue
 
                 relative_path = req.text.split("\n")[5]
                 full_url = urljoin(base_url, relative_path)
                 try:
-                    response = requests.get(full_url, headers=self.headers)
+                    response = requests.get(full_url, headers=self.headers, timeout=30)
                     with open(file_path, "wb") as f:
                         f.write(response.content)
                 except Exception as e:
                     logger.warning(
                         "Could not download subtitle: " + title + " cause: " + str(e)
                     )
+                    continue
 
                 logger.info("Downloaded subtitle: " + subtitle_filename)
 
