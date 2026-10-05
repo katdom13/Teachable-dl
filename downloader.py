@@ -151,6 +151,33 @@ class TeachableDownloader:
 
         commit_element.click()
 
+        # Check for login error due to incorrect credentials
+        logger.debug("Checking for login error")
+        try:
+            error_elements = WebDriverWait(self.driver, self.global_timeout).until(
+                EC.presence_of_all_elements_located(
+                    (By.CSS_SELECTOR, "div.toast, span.text-with-icon")
+                )
+            )
+            for element in error_elements:
+                if "Your email or password is incorrect" in element.text:
+                    logger.error("Login failed: Incorrect email or password.")
+                    return False
+        except TimeoutException:
+            # No error elements found, assuming login was successful
+            pass
+
+        # Check for new device challenge
+        # input with name otp_code
+        if self.check_elem_exists(By.NAME, "otp_code", timeout=self.global_timeout):
+            # wait for user to enter code
+            input(
+                "\033[93mWarning: New device challenge\nplease enter the code sent to your email and press enter to "
+                "continue\033[0m"
+            )
+        logger.info("Logged in, switching to course page")
+        time.sleep(3)
+
     def run(self, course_url, email, password, login_url, man_login_url):
         logger.info("Starting login")
 
