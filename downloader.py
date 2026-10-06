@@ -358,7 +358,7 @@ class TeachableDownloader:
         course_path = create_folder(course_title)
 
         self.save_course_html(course_path)
-        self.get_course_image_classic(course_path)
+        self.get_course_image(course_path, By.CLASS_NAME, "course-image")
 
         chapter_idx = 1
         video_list = []
@@ -406,7 +406,9 @@ class TeachableDownloader:
         course_path = create_folder(course_title)
 
         self.save_course_html(course_path)
-        self.get_course_image_simple(course_path)
+        self.get_course_image(
+            course_path, By.XPATH, '//*[@id="__next"]/div/div/div[2]/div/div[1]/img'
+        )
 
         chapter_idx = 0
         video_list = []
@@ -496,8 +498,8 @@ class TeachableDownloader:
         logger.info("Image downloaded successfully.")
         return True
 
-    def get_course_image_classic(self, course_path):
-        image_element = self.driver.find_elements(By.CLASS_NAME, "course-image")
+    def get_course_image(self, course_path, by, selector):
+        image_element = self.driver.find_elements(by, selector)
 
         if not image_element:
             logger.warning("No course image element found")
@@ -511,22 +513,6 @@ class TeachableDownloader:
             image_src_hd = re.sub(r"/resize=.+?/", "/", image_src)
             if self.save_course_image(course_path, image_src_hd):
                 return
-            self.save_course_image(course_path, image_src)
-        except Exception as e:
-            logger.warning("Could not find course image: " + str(e))
-
-    def get_course_image_simple(self, course_path):
-        image_element = self.driver.find_elements(
-            By.XPATH, '//*[@id="__next"]/div/div/div[2]/div/div[1]/img'
-        )
-
-        if not image_element:
-            logger.warning("No course image element found")
-            return
-
-        try:
-            logger.info("Found course image")
-            image_src = image_element[0].get_attribute("src")
             self.save_course_image(course_path, image_src)
         except Exception as e:
             logger.warning("Could not find course image: " + str(e))
