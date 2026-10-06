@@ -479,16 +479,22 @@ class TeachableDownloader:
         return clean_string(course_title)
 
     def save_course_image(self, course_path, image_src):
-        response = requests.get(image_src, timeout=30)
-        if response.ok:
-            # save the image to disk
-            image_path = os.path.join(course_path, "course-image.jpg")
-            with open(image_path, "wb") as f:
-                f.write(response.content)
-            logger.info("Image downloaded successfully.")
-        else:
-            # print a message indicating that the image download failed
+        try:
+            response = requests.get(image_src, timeout=30)
+        except Exception as e:
+            logger.warning("Could not download course image: " + str(e))
+            return False
+
+        if not response.ok:
             logger.warning("Failed to download image.")
+            return False
+
+        # save the image to disk
+        image_path = os.path.join(course_path, "course-image.jpg")
+        with open(image_path, "wb") as f:
+            f.write(response.content)
+        logger.info("Image downloaded successfully.")
+        return True
 
     def get_course_image_classic(self, course_path):
         image_element = self.driver.find_elements(By.CLASS_NAME, "course-image")
@@ -500,9 +506,12 @@ class TeachableDownloader:
         try:
             logger.info("Found course image")
             image_src = image_element[0].get_attribute("src")
-            # try to download the image using the modified link first
+            # Try the high-definition version first, falling back to the
+            # original link if that fails for any reason.
             image_src_hd = re.sub(r"/resize=.+?/", "/", image_src)
-            self.save_course_image(course_path, image_src_hd)
+            if self.save_course_image(course_path, image_src_hd):
+                return
+            self.save_course_image(course_path, image_src)
         except Exception as e:
             logger.warning("Could not find course image: " + str(e))
 
