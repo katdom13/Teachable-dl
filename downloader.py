@@ -304,7 +304,7 @@ class TeachableDownloader:
         wait = WebDriverWait(self.driver, timeout=self.global_timeout)
         sections = wait.until(
             EC.presence_of_all_elements_located(
-                (By.CSS_SELECTOR, ".block__curriculum .block__section")
+                (By.CSS_SELECTOR, ".block__curriculum__section")
             )
         )
         for section in sections:
@@ -322,7 +322,7 @@ class TeachableDownloader:
             idx = 1
 
             section_items = section.find_elements(
-                By.CSS_SELECTOR, ".block__curriculum__section__item"
+                By.CSS_SELECTOR, ".block__curriculum__section__list__item__link"
             )
             for item in section_items:
                 lecture_link = item.get_attribute("href")
@@ -337,7 +337,6 @@ class TeachableDownloader:
                 logger.info("Found lecture: " + lecture_title)
 
                 truncated_lecture_title = truncate_title_to_fit_filename(lecture_title)
-
                 video_entity = {
                     "link": lecture_link,
                     "title": truncated_lecture_title,
