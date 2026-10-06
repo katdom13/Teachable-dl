@@ -216,7 +216,7 @@ class TeachableDownloader:
         This method handles batch downloading of courses. It navigates to the given URLs, logs in if necessary,
         and initiates the download process for each course.
 
-        :param url_array: List[str]
+        :param url_list: List[str]
             An array of URLs pointing to the courses that need to be downloaded.
         :param email: str
             The email address used to log in to the platform.
@@ -568,11 +568,11 @@ class TeachableDownloader:
                     + str(e)
                 )
 
-            vid_iframes = self.driver.find_elements(
+            video_iframes = self.driver.find_elements(
                 By.XPATH, "//iframe[starts-with(@data-testid, 'embed-player')]"
             )
 
-            for i, iframe in enumerate(vid_iframes):
+            for i, iframe in enumerate(video_iframes):
                 try:
                     logger.info("Switching to video frame")
                     self.driver.switch_to.frame(iframe)
@@ -584,19 +584,19 @@ class TeachableDownloader:
                     ][0]["urlEncrypted"]
 
                     # Append -n to the video title if there are multiple iframes
-                    vid_title = title + (
-                        "-" + str(i + 1) if len(vid_iframes) > 1 else ""
+                    video_title = title + (
+                        "-" + str(i + 1) if len(video_iframes) > 1 else ""
                     )
 
                     try:
                         logger.info("Downloading subtitle")
                         self.download_subtitle(
-                            url_encrypted, vid_title, idx, download_path
+                            url_encrypted, video_title, idx, download_path
                         )
                     except Exception as e:
                         logger.warning(
                             "Could not download subtitle: "
-                            + vid_title
+                            + video_title
                             + " cause: "
                             + str(e)
                         )
@@ -604,12 +604,12 @@ class TeachableDownloader:
                     try:
                         logger.info("Downloading video")
                         self.download_video(
-                            url_encrypted, vid_title, idx, download_path
+                            url_encrypted, video_title, idx, download_path
                         )
                     except Exception as e:
                         logger.warning(
                             "Could not download video: "
-                            + vid_title
+                            + video_title
                             + " cause: "
                             + str(e)
                         )
@@ -634,51 +634,51 @@ class TeachableDownloader:
                         + str(e)
                     )
 
-    def save_webpage_as_html(self, title, idx, output_path):
-        output_file = os.path.join(output_path, f"{idx:02d}-{title}.html")
+    def save_webpage_as_html(self, title, video_index, output_path):
+        output_file = os.path.join(output_path, f"{video_index:02d}-{title}.html")
         with open(output_file, "w+", encoding="utf-8") as f:
             f.write(self.driver.page_source)
         logger.info("Saved webpage as html: " + output_file)
 
-    def download_attachments(self, link, title, idx, output_path):
-        vid_title = f"{idx:02d}-{title}"
+    def download_attachments(self, link, title, video_index, output_path):
+        video_title = f"{video_index:02d}-{title}"
 
         # Grab the video attachments type file
-        vid_attachments = self.driver.find_elements(
+        video_attachments = self.driver.find_elements(
             By.CLASS_NAME, "lecture-attachment-type-file"
         )
-        if vid_attachments:
+        if video_attachments:
             # Get all links from the video attachments
-            vid_links = vid_attachments[0].find_elements(By.TAG_NAME, "a")
-            output_path = os.path.join(output_path, vid_title)
+            video_links = video_attachments[0].find_elements(By.TAG_NAME, "a")
+            output_path = os.path.join(output_path, video_title)
             os.makedirs(output_path, exist_ok=True)
 
             # Get href attribute from the first link
-            if vid_links:
-                for vid_link_elem in vid_links:
-                    href = vid_link_elem.get_attribute("href")
-                    filename = vid_link_elem.text
+            if video_links:
+                for video_link in video_links:
+                    link = video_link.get_attribute("href")
+                    filename = video_link.text
                     logger.info(
                         "Downloading attachment: " + filename + " for video: " + title
                     )
                     # Download file and save the file in output_path directory
-                    wget.download(href, out=output_path)
+                    wget.download(link, out=output_path)
         else:
             logger.warning("No attachments found for video: " + title)
 
-    def download_video_file(self, title, idx, output_path, timeout=60):
-        vid_title = f"{idx:02d}-{title}"
+    def download_video_file(self, title, video_index, output_path, timeout=60):
+        video_title = f"{video_index:02d}-{title}"
 
         # Grab the video attachments type video
-        vid_attachment = self.driver.find_element(
+        video_attachment = self.driver.find_element(
             By.CLASS_NAME, "lecture-attachment-type-video"
         )
-        if not vid_attachment:
+        if not video_attachment:
             logger.debug(f"No video attachment found for lecture: {title}")
             return False
 
-        vid_link = vid_attachment.find_element(By.TAG_NAME, "a")
-        if not vid_link:
+        video_link = video_attachment.find_element(By.TAG_NAME, "a")
+        if not video_link:
             logger.debug(f"No video link found for lecture: {title}")
             return False
 
@@ -694,7 +694,7 @@ class TeachableDownloader:
         files_before_download = set(os.listdir(output_path))
 
         # Click the link to trigger download
-        vid_link.click()
+        video_link.click()
 
         # Wait for download to complete
         start_time = time.time()
@@ -721,7 +721,7 @@ class TeachableDownloader:
         _, extension = os.path.splitext(latest_file)
 
         # Create the new filename
-        new_filename = f"{vid_title}{extension}"
+        new_filename = f"{video_title}{extension}"
         new_filepath = os.path.join(output_path, new_filename)
 
         # Rename the file
@@ -730,7 +730,7 @@ class TeachableDownloader:
         return True
 
     # This function is needed because yt-dlp subtitle downloader is not working
-    def download_subtitle(self, link, title, idx, output_path):
+    def download_subtitle(self, link, title, video_index, output_path):
         ydl_opts = {
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
@@ -771,7 +771,9 @@ class TeachableDownloader:
 
         # Print the subtitle links and language names
         for lang, sub in subtitle_links.items():
-            subtitle_filename = "{:02d}-{}.{}.{}".format(idx, title, lang, sub["ext"])
+            subtitle_filename = "{:02d}-{}.{}.{}".format(
+                video_index, title, lang, sub["ext"]
+            )
             file_path = os.path.join(output_path, subtitle_filename)
             if os.path.isfile(file_path):
                 logger.info("Skipping existing subtitle: " + subtitle_filename)
@@ -799,7 +801,7 @@ class TeachableDownloader:
 
                 logger.info("Downloaded subtitle: " + subtitle_filename)
 
-    def download_video(self, link, title, idx, output_path):
+    def download_video(self, link, title, video_index, output_path):
         ydl_opts = {
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
@@ -814,7 +816,7 @@ class TeachableDownloader:
             ],
             "http_headers": self.headers,
             "concurrentfragments": 15,
-            "outtmpl": os.path.join(output_path, f"{idx:02d}-{title}.mp4"),
+            "outtmpl": os.path.join(output_path, f"{video_index:02d}-{title}.mp4"),
             "verbose": self.verbose,
         }
 
