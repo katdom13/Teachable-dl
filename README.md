@@ -186,6 +186,24 @@ python3 main.py --url <course_url> --manual-login --verbose
 
 > Log in yourself in the browser window that opens (including any captcha). The download starts automatically once you're logged in.
 
+or download several courses from a file
+
+```sh
+python3 main.py --file courses.csv --verbose
+```
+
+The file is either one course URL per line, or a CSV with a `url,email,password,login_url` header
+where every column except `url` is optional:
+
+```csv
+url,email,password,login_url
+https://school-a.com/p/course-one,me@example.com,my-password,
+https://school-b.com/courses/course-two,other@example.com,"pass,with,commas",
+```
+
+Blank lines and lines starting with `#` are skipped. Empty values fall back to `--email`, `--password`
+and `--login_url`. Courses are grouped by site and account, and each group logs in once.
+
 For a list of all available options and up-to-date parameters, use the --help command:
 ```shell
 python main.py --help
