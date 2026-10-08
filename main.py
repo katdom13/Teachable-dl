@@ -108,16 +108,11 @@ class TeachableDownloader:
         logging.info("Starting login")
 
         if man_login_url is None:
-            # Check if login_url is not set
-            if login_url is None:
-                try:
-                    self.find_login(course_url)
-                except Exception as e:
-                    logging.error("Could not find login: " + str(e), exc_info=self.verbose)
-            else:
-                self.driver.get(login_url)
-
             try:
+                if login_url:
+                    self.driver.get(login_url)
+                else:
+                    self.go_to_login_page(course_url)
                 self.login(email, password)
             except Exception as e:
                 logging.error("Could not login: " + str(e), exc_info=self.verbose)
@@ -190,23 +185,59 @@ class TeachableDownloader:
         fallback_url = urlunparse((parsed_url.scheme, parsed_url.netloc, sign_in_path, '', '', ''))
         return fallback_url
 
-    def find_login(self, course_url):
+    def go_to_login_page(self, course_url):
         logging.info("Trying to find login")
-
-        self.driver.implicitly_wait(self.global_timeout)
         self.driver.get(course_url)
 
+        # Step 1: course site -> Login link (falls back to constructed sign-in URL)
         try:
-            login_element = WebDriverWait(self.driver, self.global_timeout).until(
-                EC.presence_of_element_located((By.LINK_TEXT, "Login"))
+            self.follow_link(By.LINK_TEXT, "Login")
+        except TimeoutException:
+            logging.warning("Login link not found, navigating to fallback URL")
+            self.driver.get(self.construct_sign_in_url(course_url))
+
+        # Step 2: Teachable SSO lands on the OTP form first; switch to the password form
+        self.switch_to_password_login()
+
+    def switch_to_password_login(self):
+        # Step 1 redirects through sso.teachable.com, so wait for it to land on a login form
+        try:
+            WebDriverWait(self.driver, self.global_timeout).until(
+                EC.url_matches(r"/identity/login/(otp|password)")
             )
         except TimeoutException:
-            logging.warning("Login button not found, navigating to fallback URL")
-            fallback_url = self.construct_sign_in_url(course_url)
-            self.driver.get(fallback_url)
-        else:
-            login_element.click()
+            logging.info("Not on an SSO login page - no action required")
+            return
 
+        parsed_url = urlparse(self.driver.current_url)
+        # Pattern: /secure/{schoolID}/identity/login/otp
+        match = re.search(r"(/secure/\d+/identity/login)/otp", parsed_url.path)
+        if not match:
+            logging.info("Already on the password login page")
+            return
+
+        try:
+            self.follow_link(By.ID, "login-with-password-link")
+            return
+        except TimeoutException:
+            logging.warning("'Log in with a password' link not found - constructing password login URL")
+
+        password_login_url = urlunparse(
+            (parsed_url.scheme, parsed_url.netloc, match.group(1) + "/password", "", "force=true", "")
+        )
+        logging.info(f"Switching from OTP to password login: {password_login_url}")
+        self.driver.get(password_login_url)
+
+    def follow_link(self, by, selector, timeout=None):
+        element = WebDriverWait(self.driver, timeout or self.global_timeout).until(
+            EC.presence_of_element_located((by, selector))
+        )
+        href = element.get_attribute("href")
+        if href and not href.endswith("#"):
+            self.driver.get(href)
+        else:
+            element.click()
+    
     def login(self, email, password):
         logging.info("Logging in")
 
@@ -226,38 +257,35 @@ class TeachableDownloader:
         logging.debug("Filling in login form")
         email_element.click()
         email_element.clear()
-        self.driver.execute_script("document.getElementById('email').value='" + email + "'")
+        self.driver.execute_script("arguments[0].value = arguments[1]", email_element, email)
 
         password_element.click()
         password_element.clear()
-        self.driver.execute_script("document.getElementById('password').value='" + password + "'")
+        self.driver.execute_script("arguments[0].value = arguments[1]", password_element, password)
 
         commit_element.click()
 
+        # Wait for whichever outcome comes first: redirect away from login, error toast, or new device challenge
+        logging.debug("Waiting for login result")
+        WebDriverWait(self.driver, self.global_timeout).until(EC.any_of(
+            EC.none_of(EC.url_contains("/identity/login")),
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.toast, span.text-with-icon")),
+            EC.presence_of_element_located((By.NAME, "otp_code")),
+        ))
+
         # Check for login error due to incorrect credentials
-        logging.debug("Checking for login error")
-        try:
-            error_elements = WebDriverWait(self.driver, self.global_timeout).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.toast, span.text-with-icon"))
-            )
-            for element in error_elements:
-                if "Your email or password is incorrect" in element.text:
-                    logging.error("Login failed: Incorrect email or password.")
-                    return False
-        except TimeoutException:
-            # No error message found, continue
-            pass
+        for element in self.driver.find_elements(By.CSS_SELECTOR, "div.toast, span.text-with-icon"):
+            if "Your email or password is incorrect" in element.text:
+                raise RuntimeError("Incorrect email or password")
 
         # Check for new device challenge
-        # input with name otp_code
-        if self.check_elem_exists(By.NAME, "otp_code", timeout=self.global_timeout):
+        if self.driver.find_elements(By.NAME, "otp_code"):
             # wait for user to enter code
             input(
                 "\033[93mWarning: New device challenge\nplease enter the code sent to your email and press enter to "
                 "continue\033[0m"
             )
         logging.info("Logged in, switching to course page")
-        time.sleep(3)
 
     def pick_course_downloader(self, course_url):
         # Check if we are already on the course page
