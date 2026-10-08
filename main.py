@@ -104,10 +104,12 @@ class TeachableDownloader:
             logging.info("No need to bypass cloudflare")
             return
 
-    def run(self, course_url, email, password, login_url, man_login_url):
+    def run(self, course_url, email, password, login_url, manual_login=False):
         logging.info("Starting login")
 
-        if man_login_url is None:
+        if manual_login:
+            self.wait_for_manual_login(course_url)
+        else:
             try:
                 if login_url:
                     self.driver.get(login_url)
@@ -117,12 +119,6 @@ class TeachableDownloader:
             except Exception as e:
                 logging.error("Could not login: " + str(e), exc_info=self.verbose)
                 return
-        else:
-            self.driver.get(course_url)
-            while self.driver.current_url != man_login_url:
-                time.sleep(3)
-                logging.info("Waiting for user to navigate to url: " + man_login_url)
-                logging.info("Current url: " + self.driver.current_url)
 
         logging.info("Starting download of course: " + course_url)
         try:
@@ -130,7 +126,7 @@ class TeachableDownloader:
         except Exception as e:
             logging.error("Could not download course: " + course_url + " cause: " + str(e))
 
-    def run_batch(self, url_array, email, password, login_url, man_login_url):
+    def run_batch(self, url_array, email, password, login_url, manual_login=False):
         """
         This method handles batch downloading of courses. It navigates to the given URLs, logs in if necessary,
         and initiates the download process for each course.
@@ -143,15 +139,16 @@ class TeachableDownloader:
             The password associated with the provided email address.
         :param login_url: str
             The URL of the login page. If not provided, manual login is assumed.
-        :param man_login_url: str
-            The URL of the page to navigate to after manual login. This parameter is optional.
-            If provided, the script will wait until the user has manually navigated to this URL
-            before starting the download process.
+        :param manual_login: bool
+            If True, the user logs in themselves in the browser window and the download
+            starts automatically once they are logged in.
         :return: None
         """
         logging.info("Starting login")
 
-        if man_login_url is None:
+        if manual_login:
+            self.wait_for_manual_login(url_array[0])
+        else:
             # Check if login_url is not set
             if login_url is not None:
                 self.driver.get(login_url)
@@ -164,12 +161,6 @@ class TeachableDownloader:
             except Exception as e:
                 logging.error("Could not login: " + str(e), exc_info=self.verbose)
                 return
-        else:
-            self.driver.get(url_array[0])
-            while self.driver.current_url != man_login_url:
-                time.sleep(3)
-                logging.info("Waiting for user to navigate to url: " + man_login_url)
-                logging.info("Current url: " + self.driver.current_url)
 
         logging.info("Running batch download of courses ")
         for url in url_array:
@@ -286,6 +277,68 @@ class TeachableDownloader:
                 "continue\033[0m"
             )
         logging.info("Logged in, switching to course page")
+
+    def logged_out_reason(self):
+        # A sign-in form (email + password together, not just a stray "email"
+        # input elsewhere on the page, e.g. a newsletter signup), a login/OTP
+        # URL, a "Login" link on the course page, or the "content locked"
+        # message all mean we're not authenticated yet. Returns why, or None
+        # if none of that applies.
+        try:
+            current_url = self.driver.current_url
+            if self.driver.find_elements(By.ID, "email") and self.driver.find_elements(By.ID, "password"):
+                return "sign-in form (email + password fields) present"
+            if re.search(r"/sign_in|/identity/login", current_url):
+                return "current URL looks like a sign-in/OTP page"
+            if self.driver.find_elements(By.LINK_TEXT, "Login"):
+                return "'Login' link present on the page"
+            if "content locked" in self.driver.page_source.lower():
+                return "'content locked' message present"
+        except Exception as e:
+            logging.warning("logged_out_reason: could not inspect page: " + str(e))
+            return "could not read browser state (" + str(e) + ")"
+        return None
+
+    def wait_for_manual_login(self, start_url):
+        logging.info("Manual login mode: waiting for you to log in.")
+        if self.driver.current_url != start_url:
+            self.driver.get(start_url)
+
+        print(
+            "\033[93mManual login mode: please log in yourself in the browser window (enter your email/password "
+            "and solve the captcha if one appears). The download will start automatically once you're logged "
+            "in.\033[0m"
+        )
+
+        poll_count = 0
+        while True:
+            logging.debug(f"wait_for_manual_login: poll #{poll_count + 1}")
+            reason = self.logged_out_reason()
+            if not reason:
+                break
+            poll_count += 1
+            if poll_count % 5 == 0:
+                logging.info(f"Still waiting ({reason}); current url: {self.driver.current_url}")
+            time.sleep(3)
+
+        # logged_out_reason() can return None a moment before the browser
+        # finishes redirecting to the final course page, so wait for the URL
+        # to stop changing, then force a clean reload - otherwise the
+        # downloader can grab elements from a DOM that's still mid-navigation
+        # and hit stale element errors.
+        previous_url = None
+        current_url = self.driver.current_url
+        for _ in range(self.global_timeout * 2):
+            if current_url == previous_url:
+                break
+            previous_url = current_url
+            time.sleep(0.5)
+            current_url = self.driver.current_url
+
+        logging.info("Manual login detected, reloading course page before starting download.")
+        self.driver.get(start_url)
+        WebDriverWait(self.driver, self.global_timeout).until(
+            EC.presence_of_element_located((By.TAG_NAME, 'body')))
 
     def pick_course_downloader(self, course_url):
         # Check if we are already on the course page
@@ -840,9 +893,9 @@ def read_urls_from_file(file_path):
 
 
 def check_required_args(args):
-    if args.email and args.password:
+    if args.manual_login:
         return True
-    elif args.man_login_url:
+    if args.email and args.password:
         return True
     return False
 
@@ -857,13 +910,14 @@ if __name__ == "__main__":
     parser.add_argument('--complete-lecture', action='store_true', default=False,
                         help='Complete the lecture after downloading')
     parser.add_argument("--login_url", required=False, help='(Optional) URL to teachable SSO login page')
-    parser.add_argument("--man_login_url", required=False,
-                        help='Login manually and start downloading when this url is reached')
+    parser.add_argument("-ml", "--manual-login", action='store_true', default=False,
+                        help='Log in yourself in the browser (email/password and any captcha); '
+                             'the download starts automatically once you are logged in')
     parser.add_argument("-f", "--file", required=False, help='Path to a text file that contains URLs')
     parser.add_argument("--user-agent", required=False, help='User agent to use when downloading videos',
                         default="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                                 "Chrome/116.0.0.0 Safari/537.36")
-    parser.add_argument("-t", "--timeout", required=False, help='Timeout for selenium driver', default=10)
+    parser.add_argument("-t", "--timeout", required=False, help='Timeout for selenium driver', type=int, default=10)
     args = parser.parse_args()
     verbose = False
     if args.verbose == 0:
@@ -877,7 +931,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
 
     if not check_required_args(args):
-        logging.error("Required arguments are missing. Choose email/password or manual login (man_login_url).")
+        logging.error("Required arguments are missing. Choose email/password or --manual-login.")
         exit(1)
 
     downloader = TeachableDownloader(verbose_arg=verbose, complete_lecture_arg=args.complete_lecture,
@@ -885,7 +939,7 @@ if __name__ == "__main__":
     if args.file:
         urls = read_urls_from_file(args.file)
         try:
-            downloader.run_batch(urls, args.email, args.password, args.login_url, args.man_login_url)
+            downloader.run_batch(urls, args.email, args.password, args.login_url, manual_login=args.manual_login)
             downloader.clean_up()
             sys.exit(0)
         except KeyboardInterrupt:
@@ -903,7 +957,7 @@ if __name__ == "__main__":
             sys.exit(1)
         try:
             downloader.run(course_url=args.url, email=args.email, password=args.password, login_url=args.login_url,
-                           man_login_url=args.man_login_url)
+                           manual_login=args.manual_login)
             downloader.clean_up()
             sys.exit(0)
         except KeyboardInterrupt:
