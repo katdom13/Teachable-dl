@@ -726,6 +726,69 @@ class TeachableDownloader:
             By.XPATH, "//iframe[starts-with(@data-testid, 'embed-player')]"
         )
 
+    def download_video_widget(
+        self, widget, widget_index, total_widgets, title, idx, download_path
+    ):
+        # Later widgets can take much longer to mount their iframe, so wait well past
+        # global_timeout. Scroll once, then poll: re-scrolling can reset the lazy-loader's
+        # visibility timer and stop the widget from mounting at all.
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", widget
+        )
+
+        iframe = None
+        max_wait_seconds = max(self.global_timeout * 3, 30)
+        deadline = time.time() + max_wait_seconds
+        attempt_num = 0
+
+        while time.time() < deadline:
+            attempt_num += 1
+            # descendant-or-self: a widget may be the iframe itself (see find_video_widgets)
+            frames = widget.find_elements(
+                By.XPATH,
+                "descendant-or-self::iframe[starts-with(@data-testid, 'embed-player')]",
+            )
+            if frames:
+                iframe = frames[0]
+                break
+            if attempt_num % 4 == 0:
+                logger.debug(
+                    f"Still waiting for video {widget_index + 1}/{total_widgets} to mount its player ({title})"
+                )
+            time.sleep(1)  # Wait a bit before retrying
+
+        if iframe is None:
+            raise TimeoutException(
+                f"video {widget_index + 1}/{total_widgets} never mounted its player within {max_wait_seconds}s"
+            )
+
+        logger.info("Switching to video frame")
+        self.driver.switch_to.frame(iframe)
+
+        # Lazy-loaded iframes may not have rendered the video data
+        # yet, so wait for it rather than failing immediately.
+        script_text = WebDriverWait(self.driver, self.global_timeout).until(
+            EC.presence_of_element_located((By.ID, "__NEXT_DATA__"))
+        )
+        json_text = json.loads(script_text.get_attribute("innerHTML"))
+        link = json_text["props"]["pageProps"]["applicationData"]["mediaAssets"][0][
+            "urlEncrypted"
+        ]
+
+        # Append -n to the video title if there are multiple widgets
+        video_title = title + ("-" + str(widget_index + 1) if total_widgets > 1 else "")
+
+        try:
+            logger.info("Downloading subtitle")
+            self.download_subtitle(link, video_title, idx, download_path)
+        except Exception as e:
+            logger.warning(
+                "Could not download subtitle: " + video_title + " cause: " + str(e)
+            )
+
+        logger.info("Downloading video")
+        return self.download_video(link, video_title, idx, download_path)
+
     def download_videos_from_links(self, video_list):
         for video in video_list:
             link = video["link"]
@@ -784,69 +847,6 @@ class TeachableDownloader:
             # mounts its embed-player iframe asynchronously via JS after the page loads
             video_widgets = self.find_video_widgets()
 
-            def attempt_widget_download(widget, widget_index, total_widgets):
-                self.driver.execute_script(
-                    "arguments[0].scrollIntoView({block: 'center'});", widget
-                )
-
-                iframe = None
-                max_wait_seconds = max(self.global_timeout * 3, 30)
-                deadline = time.time() + max_wait_seconds
-                attempt_num = 0
-
-                while time.time() < deadline:
-                    attempt_num += 1
-                    # descendant-or-self: a widget may be the iframe itself (see find_video_widgets)
-                    frames = widget.find_elements(
-                        By.XPATH,
-                        "descendant-or-self::iframe[starts-with(@data-testid, 'embed-player')]",
-                    )
-                    if frames:
-                        iframe = frames[0]
-                        break
-                    if attempt_num % 4 == 0:
-                        logger.debug(
-                            f"Still waiting for video {widget_index + 1}/{total_widgets} to mount its player ({title})"
-                        )
-                    time.sleep(1)  # Wait a bit before retrying
-
-                if iframe is None:
-                    raise TimeoutException(
-                        f"video {widget_index + 1}/{total_widgets} never mounted its player within {max_wait_seconds}s"
-                    )
-
-                logger.info("Switching to video frame")
-                self.driver.switch_to.frame(iframe)
-
-                # Lazy-loaded iframes may not have rendered the video data
-                # yet, so wait for it rather than failing immediately.
-                script_text = WebDriverWait(self.driver, self.global_timeout).until(
-                    EC.presence_of_element_located((By.ID, "__NEXT_DATA__"))
-                )
-                json_text = json.loads(script_text.get_attribute("innerHTML"))
-                link = json_text["props"]["pageProps"]["applicationData"][
-                    "mediaAssets"
-                ][0]["urlEncrypted"]
-
-                # Append -n to the video title if there are multiple widgets
-                video_title = title + (
-                    "-" + str(widget_index + 1) if total_widgets > 1 else ""
-                )
-
-                try:
-                    logger.info("Downloading subtitle")
-                    self.download_subtitle(link, video_title, idx, download_path)
-                except Exception as e:
-                    logger.warning(
-                        "Could not download subtitle: "
-                        + video_title
-                        + " cause: "
-                        + str(e)
-                    )
-
-                logger.info("Downloading video")
-                return self.download_video(link, video_title, idx, download_path)
-
             total_widgets = len(video_widgets)
             for i, widget in enumerate(video_widgets):
                 current_widget = widget
@@ -873,7 +873,9 @@ class TeachableDownloader:
                                 break
                             current_widget = refreshed_widgets[i]
 
-                        if attempt_widget_download(current_widget, i, total_widgets):
+                        if self.download_video_widget(
+                            current_widget, i, total_widgets, title, idx, download_path
+                        ):
                             break
                     except Exception as e:
                         logger.warning(
