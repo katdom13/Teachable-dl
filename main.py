@@ -652,20 +652,32 @@ class TeachableDownloader:
         return clean_string(course_title)
 
     def save_course_image(self, course_path, image_src):
+        image_path = os.path.join(course_path, "course-image.jpg")
+
+        # Skip existing image if it already exists
+        if os.path.exists(image_path):
+            logger.info("Image already exists, skipping download.")
+            return True
+
         try:
             response = requests.get(image_src, timeout=30)
-        except Exception as e:
+        except requests.RequestException as e:
             logger.warning("Could not download course image: " + str(e))
             return False
 
         if not response.ok:
-            logger.warning("Failed to download image.")
+            logger.warning(
+                f"Failed to download image (HTTP {response.status_code}): {image_src}"
+            )
             return False
 
-        # save the image to disk
-        image_path = os.path.join(course_path, "course-image.jpg")
-        with open(image_path, "wb") as f:
+        # Write to a temporary file first so an interrupted write never leaves a
+        # partial image at image_path, which the existence check would skip
+        part_path = image_path + ".part"
+        with open(part_path, "wb") as f:
             f.write(response.content)
+        os.replace(part_path, image_path)
+
         logger.info("Image downloaded successfully.")
         return True
 
