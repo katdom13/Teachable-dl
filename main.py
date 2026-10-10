@@ -79,19 +79,8 @@ class TeachableDownloader:
         self._complete_lecture = complete_lecture_arg
         self.global_timeout = timeout_arg
 
-    def check_elem_exists(self, by, selector, timeout):
-        try:
-            WebDriverWait(self.driver, timeout=self.global_timeout).until(
-                EC.presence_of_element_located((by, selector))
-            )
-        except Exception:
-            return False
-        return True
-
     def bypass_cloudflare_if_present(self):
-        if self.check_elem_exists(
-            By.ID, "challenge-stage", timeout=self.global_timeout
-        ):
+        if self.driver.find_elements(By.ID, "challenge-stage"):
             self.bypass_cloudflare()
         else:
             logger.info("No need to bypass cloudflare")
@@ -423,8 +412,7 @@ class TeachableDownloader:
 
     def login_if_needed(self, course_url, email, password, login_url):
         self.driver.get(course_url)
-        if self.driver.find_elements(By.ID, "challenge-stage"):
-            self.bypass_cloudflare()
+        self.bypass_cloudflare_if_present()
 
         if not self.logged_out_reason():
             logger.info("Already logged in, skipping login")
