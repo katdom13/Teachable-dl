@@ -20,6 +20,11 @@ from seleniumbase import Driver
 
 logger = logging.getLogger(__name__)
 
+# Elements that download_videos_from_links() downloads from on a lecture page
+LECTURE_CONTENT_SELECTOR = (
+    "[class*='lecture-attachment-type-'], iframe[data-testid^='embed-player']"
+)
+
 
 def create_folder(course_title):
     root_path = os.path.abspath(os.getcwd())
@@ -709,6 +714,18 @@ class TeachableDownloader:
         except Exception as e:
             logger.error("Could not save course html: " + str(e), exc_info=self.verbose)
 
+    def find_video_widgets(self):
+        # Most templates wrap each video in a widget that mounts its player iframe later via JS;
+        # for templates without those widgets, fall back to the player iframes on the page
+        widgets = self.driver.find_elements(
+            By.CLASS_NAME, "lecture-attachment-type-video"
+        )
+        if widgets:
+            return widgets
+        return self.driver.find_elements(
+            By.XPATH, "//iframe[starts-with(@data-testid, 'embed-player')]"
+        )
+
     def download_videos_from_links(self, video_list):
         for video in video_list:
             link = video["link"]
@@ -719,9 +736,21 @@ class TeachableDownloader:
             if self.driver.current_url != link:
                 logger.info("Navigating to lecture: " + title)
                 self.driver.get(link)
-                self.driver.implicitly_wait(self.global_timeout)
-            logger.info("Downloading lecture: " + title)
 
+                # Wait for the lecture content the steps below look for
+                # attachments or a video player to render
+                try:
+                    WebDriverWait(self.driver, self.global_timeout).until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, LECTURE_CONTENT_SELECTOR)
+                        )
+                    )
+                except TimeoutException:
+                    logger.warning(
+                        "No attachments or video found for lecture: " + title
+                    )
+
+            logger.info("Downloading lecture: " + title)
             try:
                 logger.info("Saving html")
                 self.save_webpage_as_html(title, idx, download_path)
@@ -751,57 +780,109 @@ class TeachableDownloader:
                     + str(e)
                 )
 
-            video_iframes = self.driver.find_elements(
-                By.XPATH, "//iframe[starts-with(@data-testid, 'embed-player')]"
-            )
+            # Iterate the widgets and wait for each one's iframe individually as each video widget
+            # mounts its embed-player iframe asynchronously via JS after the page loads
+            video_widgets = self.find_video_widgets()
 
-            for i, iframe in enumerate(video_iframes):
-                try:
-                    logger.info("Switching to video frame")
-                    self.driver.switch_to.frame(iframe)
+            def attempt_widget_download(widget, widget_index, total_widgets):
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", widget
+                )
 
-                    script_text = self.driver.find_element(By.ID, "__NEXT_DATA__")
-                    json_text = json.loads(script_text.get_attribute("innerHTML"))
-                    url_encrypted = json_text["props"]["pageProps"]["applicationData"][
-                        "mediaAssets"
-                    ][0]["urlEncrypted"]
+                iframe = None
+                max_wait_seconds = max(self.global_timeout * 3, 30)
+                deadline = time.time() + max_wait_seconds
+                attempt_num = 0
 
-                    # Append -n to the video title if there are multiple iframes
-                    video_title = title + (
-                        "-" + str(i + 1) if len(video_iframes) > 1 else ""
+                while time.time() < deadline:
+                    attempt_num += 1
+                    # descendant-or-self: a widget may be the iframe itself (see find_video_widgets)
+                    frames = widget.find_elements(
+                        By.XPATH,
+                        "descendant-or-self::iframe[starts-with(@data-testid, 'embed-player')]",
+                    )
+                    if frames:
+                        iframe = frames[0]
+                        break
+                    if attempt_num % 4 == 0:
+                        logger.debug(
+                            f"Still waiting for video {widget_index + 1}/{total_widgets} to mount its player ({title})"
+                        )
+                    time.sleep(1)  # Wait a bit before retrying
+
+                if iframe is None:
+                    raise TimeoutException(
+                        f"video {widget_index + 1}/{total_widgets} never mounted its player within {max_wait_seconds}s"
                     )
 
+                logger.info("Switching to video frame")
+                self.driver.switch_to.frame(iframe)
+
+                # Lazy-loaded iframes may not have rendered the video data
+                # yet, so wait for it rather than failing immediately.
+                script_text = WebDriverWait(self.driver, self.global_timeout).until(
+                    EC.presence_of_element_located((By.ID, "__NEXT_DATA__"))
+                )
+                json_text = json.loads(script_text.get_attribute("innerHTML"))
+                link = json_text["props"]["pageProps"]["applicationData"][
+                    "mediaAssets"
+                ][0]["urlEncrypted"]
+
+                # Append -n to the video title if there are multiple widgets
+                video_title = title + (
+                    "-" + str(widget_index + 1) if total_widgets > 1 else ""
+                )
+
+                try:
+                    logger.info("Downloading subtitle")
+                    self.download_subtitle(link, video_title, idx, download_path)
+                except Exception as e:
+                    logger.warning(
+                        "Could not download subtitle: "
+                        + video_title
+                        + " cause: "
+                        + str(e)
+                    )
+
+                logger.info("Downloading video")
+                return self.download_video(link, video_title, idx, download_path)
+
+            total_widgets = len(video_widgets)
+            for i, widget in enumerate(video_widgets):
+                current_widget = widget
+                # Signed video links are created when the page loads and expire after a while.
+                # On lectures with many videos, later links can expire (403) before we reach
+                # them, so reload the page for fresh links and retry once.
+                for attempt_num in range(2):
                     try:
-                        logger.info("Downloading subtitle")
-                        self.download_subtitle(
-                            url_encrypted, video_title, idx, download_path
-                        )
+                        if attempt_num > 0:
+                            logger.info(
+                                f"Video {i + 1}/{total_widgets} failed, likely an expired link — reloading the page and retrying once"
+                            )
+                            self.driver.get(link)
+                            WebDriverWait(self.driver, self.global_timeout).until(
+                                EC.presence_of_element_located(
+                                    (By.CSS_SELECTOR, LECTURE_CONTENT_SELECTOR)
+                                )
+                            )
+                            refreshed_widgets = self.find_video_widgets()
+                            if i >= len(refreshed_widgets):
+                                logger.warning(
+                                    f"Widget {i + 1}/{total_widgets} no longer found after reload; giving up on it"
+                                )
+                                break
+                            current_widget = refreshed_widgets[i]
+
+                        if attempt_widget_download(current_widget, i, total_widgets):
+                            break
                     except Exception as e:
                         logger.warning(
-                            "Could not download subtitle: "
-                            + video_title
-                            + " cause: "
-                            + str(e)
+                            "Could not find video: " + title + " cause: " + str(e)
                         )
-
-                    try:
-                        logger.info("Downloading video")
-                        self.download_video(
-                            url_encrypted, video_title, idx, download_path
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Could not download video: "
-                            + video_title
-                            + " cause: "
-                            + str(e)
-                        )
-
-                    self.driver.switch_to.default_content()  # Switch back to main content before the next iteration
-
-                except Exception:
-                    logger.warning("Could not find video: " + title)
-                    continue
+                    finally:
+                        # Reset top-level context so the next widget (or next lecture)
+                        # doesn't inherit a broken frame context
+                        self.driver.switch_to.default_content()
 
             logger.info("Downloaded video: " + title)
 
@@ -985,6 +1066,11 @@ class TeachableDownloader:
                 logger.info("Downloaded subtitle: " + subtitle_filename)
 
     def download_video(self, link, title, video_index, output_path):
+        output_file = os.path.join(output_path, f"{video_index:02d}-{title}.mp4")
+        if os.path.isfile(output_file):
+            logger.info("Skipping existing video: " + output_file)
+            return
+
         ydl_opts = {
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
@@ -1006,8 +1092,10 @@ class TeachableDownloader:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([link])
+            return True
         except Exception as e:
             logger.error("Could not download video: " + title + " cause: " + str(e))
+            return False
 
     def complete_lecture(self):
         self.driver.switch_to.default_content()
