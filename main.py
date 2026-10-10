@@ -1080,9 +1080,7 @@ def check_required_args(args):
     # A batch file can carry its own credentials per course
     if args.manual_login or args.file:
         return True
-    if args.email and args.password:
-        return True
-    return False
+    return bool(args.email and args.password)
 
 
 if __name__ == "__main__":
@@ -1157,7 +1155,7 @@ if __name__ == "__main__":
         logger.error(
             "Required arguments are missing. Choose email/password or --manual-login."
         )
-        exit(1)
+        sys.exit(1)
 
     downloader = TeachableDownloader(
         verbose_arg=verbose,
