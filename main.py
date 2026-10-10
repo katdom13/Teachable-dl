@@ -14,10 +14,11 @@ import selenium.webdriver.support.expected_conditions as EC
 import wget
 import yt_dlp
 from selenium.common import TimeoutException
-from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.remote.webdriver import By
 from selenium.webdriver.support.wait import WebDriverWait
 from seleniumbase import Driver
+
+logger = logging.getLogger(__name__)
 
 
 def create_folder(course_title):
@@ -28,33 +29,51 @@ def create_folder(course_title):
 
 
 def clean_string(data):
-    logging.debug("Cleaning string: " + data)
+    logger.debug("Cleaning string: " + data)
     # Remove all non-ASCII characters (including emojis)
-    data = data.encode('ascii', 'ignore').decode('ascii')
+    data = data.encode("ascii", "ignore").decode("ascii")
     # Replace specific characters with "-"
-    return data.replace("\n", "-").replace(" ", "-").replace(":", "-") \
-        .replace("/", "-").replace("|", "-").replace("*", "").replace("?", "-").replace("<", "-") \
-        .replace(">", "-").replace("\"", "-").replace("\\", "-")
+    return (
+        data.replace("\n", "-")
+        .replace(" ", "-")
+        .replace(":", "-")
+        .replace("/", "-")
+        .replace("|", "-")
+        .replace("*", "")
+        .replace("?", "-")
+        .replace("<", "-")
+        .replace(">", "-")
+        .replace('"', "-")
+        .replace("\\", "-")
+    )
 
 
-def truncate_title_to_fit_file_name(title, max_file_name_length=250):
+def truncate_title_to_fit_filename(title, max_filename_length=250):
     # the file name length should not be too long
     # truncate the title to accommodate the max used file extension length and lecture index prefix
-    max_title_length = max_file_name_length - len(".mp4.part-Frag0000.part") - 3
+    max_title_length = max_filename_length - len(".mp4.part-Frag0000.part") - 3
     if len(title) > max_title_length:
-        turncated_title = title[:max_title_length]
-        logging.warning("Truncating title: " + turncated_title)
-        return turncated_title
+        truncated_title = title[:max_title_length]
+        logger.warning("Truncating title: " + truncated_title)
+        return truncated_title
     return title
 
 
 class TeachableDownloader:
-    def __init__(self, verbose_arg=False, complete_lecture_arg=False, user_agent_arg=None, timeout_arg=10):
+    def __init__(
+        self,
+        verbose_arg=False,
+        complete_lecture_arg=False,
+        user_agent_arg="",
+        origin_arg="",
+        referer_arg="",
+        timeout_arg=10,
+    ):
         self.driver = Driver(uc=True, headed=True)
         self.headers = {
             "User-Agent": user_agent_arg,
-            "Origin": "https://player.hotmart.com",
-            "Referer": "https://player.hotmart.com"
+            "Origin": origin_arg or "https://player.hotmart.com",
+            "Referer": referer_arg or "https://player.hotmart.com",
         }
         self.verbose = verbose_arg
         self._complete_lecture = complete_lecture_arg
@@ -65,381 +84,275 @@ class TeachableDownloader:
             WebDriverWait(self.driver, timeout=self.global_timeout).until(
                 EC.presence_of_element_located((by, selector))
             )
-        except NoSuchElementException:
-            return False
-        except TimeoutException:
-            return False
         except Exception:
             return False
+        return True
+
+    def bypass_cloudflare_if_present(self):
+        if self.check_elem_exists(
+            By.ID, "challenge-stage", timeout=self.global_timeout
+        ):
+            self.bypass_cloudflare()
         else:
-            return True
+            logger.info("No need to bypass cloudflare")
 
     def bypass_cloudflare(self):
         if self.driver.capabilities["browserVersion"].split(".")[0] < "115":
             return
-        logging.info("Bypassing cloudflare")
+        logger.info("Bypassing cloudflare")
         time.sleep(1)
-        if self.check_elem_exists(By.ID, "challenge-stage", timeout=self.global_timeout):
-            try:
-                self.driver.find_element(
-                    By.ID, "challenge-stage"
-                ).click()  # make sure the challenge is focused
-                self.driver.execute_script(
-                    '''window.open("''' + self.driver.current_url + """","_blank");"""
-                )  # open page in new tab
-                input(
-                    "\033[93mWarning: Bypassing Cloudflare\nplease click on the captcha checkbox if not done already "
-                    "and press enter to continue (do not close any of the tabs)\033[0m"
-                )
-                self.driver.switch_to.window(
-                    window_name=self.driver.window_handles[0]
-                )  # switch to first tab
-                self.driver.close()  # close first tab
-                self.driver.switch_to.window(
-                    window_name=self.driver.window_handles[0]
-                )  # switch back to new tab
-            except Exception as e:
-                logging.error("Could not bypass cloudflare: " + str(e))
-                return
-        else:
-            logging.info("No need to bypass cloudflare")
-            return
 
-    def run(self, course_url, email, password, login_url, manual_login=False):
-        logging.info("Starting login")
-
-        if manual_login:
-            self.wait_for_manual_login(course_url)
-        else:
-            try:
-                if login_url:
-                    self.driver.get(login_url)
-                else:
-                    self.go_to_login_page(course_url)
-                self.login(email, password)
-            except Exception as e:
-                logging.error("Could not login: " + str(e), exc_info=self.verbose)
-                return
-
-        logging.info("Starting download of course: " + course_url)
         try:
-            self.pick_course_downloader(course_url)
+            self.driver.find_element(
+                By.ID, "challenge-stage"
+            ).click()  # make sure the challenge is focused
+            self.driver.execute_script(
+                '''window.open("''' + self.driver.current_url + """","_blank");"""
+            )  # open page in new tab
+            input(
+                "\033[93mWarning: Bypassing Cloudflare\nplease click on the captcha checkbox if not done already "
+                "and press enter to continue (do not close any of the tabs)\033[0m"
+            )
+            self.driver.switch_to.window(
+                window_name=self.driver.window_handles[0]
+            )  # switch to first tab
+            self.driver.close()  # close first tab
+            self.driver.switch_to.window(
+                window_name=self.driver.window_handles[0]
+            )  # switch back to new tab
         except Exception as e:
-            logging.error("Could not download course: " + course_url + " cause: " + str(e))
-
-    def run_batch(self, entries, email, password, login_url, manual_login=False):
-        """
-        This method handles batch downloading of courses. Courses are grouped by site and account, and each
-        group is logged in to once before its courses are downloaded.
-
-        :param entries: List[dict]
-            Course entries from read_batch_file(), each with "url", "email", "password" and "login_url" keys.
-            Missing values fall back to the email, password and login_url arguments below.
-        :param email: str
-            The default email address used to log in to the platform.
-        :param password: str
-            The default password associated with the provided email address.
-        :param login_url: str
-            The default URL of the login page. If not provided, it is found from each group's first course URL.
-        :param manual_login: bool
-            If True, the user logs in themselves in the browser window for each group and the download
-            starts automatically once they are logged in.
-        :return: None
-        """
-        if not entries:
-            logging.error("No courses to download")
+            logger.error("Could not bypass cloudflare: " + str(e))
             return
 
-        # Group courses by (site, account), keeping the order they first appear in
-        groups = {}
-        for entry in entries:
-            entry_email = entry["email"] or email
-            group = groups.setdefault((urlparse(entry["url"]).netloc, entry_email), {
-                "password": entry["password"] or password,
-                "login_url": entry["login_url"] or login_url,
-                "urls": [],
-            })
-            group["urls"].append(entry["url"])
-
-        current_email = None
-        for (domain, group_email), group in groups.items():
-            urls = group["urls"]
-            logging.info(f"Starting login for {domain} ({len(urls)} course(s))")
-
-            # Every school signs in through sso.teachable.com, so the previous account's session
-            # would carry over; clear cookies for all domains when switching accounts
-            if current_email is not None and group_email != current_email:
-                logging.info("Switching account, clearing cookies")
-                self.driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
-            current_email = group_email
-
-            try:
-                if manual_login:
-                    self.wait_for_manual_login(urls[0])
-                else:
-                    self.login_if_needed(urls[0], group_email, group["password"], group["login_url"])
-            except Exception as e:
-                logging.error(f"Could not login to {domain}: " + str(e), exc_info=self.verbose)
-                continue
-
-            logging.info(f"Running batch download of courses for {domain}")
-            for url in urls:
-                try:
-                    self.pick_course_downloader(url)
-                except Exception as e:
-                    logging.error("Could not download course: " + url + " cause: " + str(e))
-
-    def login_if_needed(self, course_url, email, password, login_url):
-        self.driver.get(course_url)
-        if self.driver.find_elements(By.ID, "challenge-stage"):
-            self.bypass_cloudflare()
-
-        if not self.logged_out_reason():
-            logging.info("Already logged in, skipping login")
-            return
-
-        if not email or not password:
-            raise ValueError("no email/password given for this course")
-
-        if login_url:
-            self.driver.get(login_url)
-        else:
-            self.go_to_login_page(course_url)
-        self.login(email, password)
+    def manual_login(self, man_login_url):
+        while self.driver.current_url != man_login_url:
+            time.sleep(3)
+            logger.info("Waiting for user to navigate to url: " + man_login_url)
+            logger.info("Current url: " + self.driver.current_url)
+        return True
 
     def construct_sign_in_url(self, course_url):
         parsed_url = urlparse(course_url)
         # Replace the path with '/sign_in'
-        sign_in_path = '/sign_in'
-        fallback_url = urlunparse((parsed_url.scheme, parsed_url.netloc, sign_in_path, '', '', ''))
+        sign_in_path = "/sign_in"
+        fallback_url = urlunparse(
+            (parsed_url.scheme, parsed_url.netloc, sign_in_path, "", "", "")
+        )
         return fallback_url
 
-    def go_to_login_page(self, course_url):
-        logging.info("Trying to find login")
+    def find_login(self, course_url):
+        logger.info("Trying to find login")
+        self.driver.implicitly_wait(self.global_timeout)
         self.driver.get(course_url)
 
-        # Step 1: course site -> Login link (falls back to constructed sign-in URL)
         try:
-            self.follow_link(By.LINK_TEXT, "Login")
-        except TimeoutException:
-            logging.warning("Login link not found, navigating to fallback URL")
-            self.driver.get(self.construct_sign_in_url(course_url))
-
-        # Step 2: Teachable SSO lands on the OTP form first; switch to the password form
-        self.switch_to_password_login()
-
-    def switch_to_password_login(self):
-        # Step 1 redirects through sso.teachable.com, so wait for it to land on a login form
-        try:
-            WebDriverWait(self.driver, self.global_timeout).until(
-                EC.url_matches(r"/identity/login/(otp|password)")
+            login_element = WebDriverWait(self.driver, self.global_timeout).until(
+                EC.presence_of_element_located((By.LINK_TEXT, "Login"))
             )
         except TimeoutException:
-            logging.info("Not on an SSO login page - no action required")
-            return
-
-        parsed_url = urlparse(self.driver.current_url)
-        # Pattern: /secure/{schoolID}/identity/login/otp
-        match = re.search(r"(/secure/\d+/identity/login)/otp", parsed_url.path)
-        if not match:
-            logging.info("Already on the password login page")
-            return
-
-        try:
-            self.follow_link(By.ID, "login-with-password-link")
-            return
-        except TimeoutException:
-            logging.warning("'Log in with a password' link not found - constructing password login URL")
-
-        password_login_url = urlunparse(
-            (parsed_url.scheme, parsed_url.netloc, match.group(1) + "/password", "", "force=true", "")
-        )
-        logging.info(f"Switching from OTP to password login: {password_login_url}")
-        self.driver.get(password_login_url)
-
-    def follow_link(self, by, selector, timeout=None):
-        element = WebDriverWait(self.driver, timeout or self.global_timeout).until(
-            EC.presence_of_element_located((by, selector))
-        )
-        href = element.get_attribute("href")
-        if href and not href.endswith("#"):
-            self.driver.get(href)
+            logger.warning("Login button not found, navigating to fallback URL")
+            fallback_url = self.construct_sign_in_url(course_url)
+            self.driver.get(fallback_url)
         else:
-            element.click()
-    
-    def login(self, email, password):
-        logging.info("Logging in")
+            login_element.click()
 
-        if self.check_elem_exists(By.ID, "challenge-stage", timeout=self.global_timeout):
-            self.bypass_cloudflare()
+    def login(self, email, password):
+        logger.info("Logging in")
+
+        self.bypass_cloudflare_if_present()
 
         WebDriverWait(self.driver, timeout=15).until(
-            EC.presence_of_element_located((By.TAG_NAME, 'body')))
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
 
         email_element = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.ID, "email")))
+            EC.presence_of_element_located((By.ID, "email"))
+        )
         password_element = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.ID, "password")))
+            EC.presence_of_element_located((By.ID, "password"))
+        )
         commit_element = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.NAME, "commit")))
+            EC.presence_of_element_located((By.NAME, "commit"))
+        )
 
-        logging.debug("Filling in login form")
+        logger.debug("Filling in login form")
         email_element.click()
         email_element.clear()
-        self.driver.execute_script("arguments[0].value = arguments[1]", email_element, email)
+        self.driver.execute_script(
+            "document.getElementById('email').value='" + email + "'"
+        )
 
         password_element.click()
         password_element.clear()
-        self.driver.execute_script("arguments[0].value = arguments[1]", password_element, password)
+        self.driver.execute_script(
+            "document.getElementById('password').value='" + password + "'"
+        )
 
         commit_element.click()
 
-        # Wait for whichever outcome comes first: redirect away from login, error toast, or new device challenge
-        logging.debug("Waiting for login result")
-        WebDriverWait(self.driver, self.global_timeout).until(EC.any_of(
-            EC.none_of(EC.url_contains("/identity/login")),
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.toast, span.text-with-icon")),
-            EC.presence_of_element_located((By.NAME, "otp_code")),
-        ))
-
         # Check for login error due to incorrect credentials
-        for element in self.driver.find_elements(By.CSS_SELECTOR, "div.toast, span.text-with-icon"):
-            if "Your email or password is incorrect" in element.text:
-                raise RuntimeError("Incorrect email or password")
+        logger.debug("Checking for login error")
+        try:
+            error_elements = WebDriverWait(self.driver, self.global_timeout).until(
+                EC.presence_of_all_elements_located(
+                    (By.CSS_SELECTOR, "div.toast, span.text-with-icon")
+                )
+            )
+            for element in error_elements:
+                if "Your email or password is incorrect" in element.text:
+                    logger.error("Login failed: Incorrect email or password.")
+                    return False
+        except TimeoutException:
+            # No error elements found, assuming login was successful
+            pass
 
         # Check for new device challenge
-        if self.driver.find_elements(By.NAME, "otp_code"):
+        # input with name otp_code
+        if self.check_elem_exists(By.NAME, "otp_code", timeout=self.global_timeout):
             # wait for user to enter code
             input(
                 "\033[93mWarning: New device challenge\nplease enter the code sent to your email and press enter to "
                 "continue\033[0m"
             )
-        logging.info("Logged in, switching to course page")
+        logger.info("Logged in, switching to course page")
+        time.sleep(3)
 
-    def logged_out_reason(self):
-        # A sign-in form (email + password together, not just a stray "email"
-        # input elsewhere on the page, e.g. a newsletter signup), a login/OTP
-        # URL, a "Login" link on the course page, or the "content locked"
-        # message all mean we're not authenticated yet. Returns why, or None
-        # if none of that applies.
+    def run(self, course_url, email, password, login_url, man_login_url):
+        logger.info("Starting login")
+
+        if not man_login_url:
+            # Check if login_url is not set
+            if not login_url:
+                try:
+                    self.find_login(course_url)
+                except Exception as e:
+                    logger.error(
+                        "Could not find login: " + str(e), exc_info=self.verbose
+                    )
+            else:
+                self.driver.get(login_url)
+
+            try:
+                self.login(email, password)
+            except Exception as e:
+                logger.error("Could not login: " + str(e), exc_info=self.verbose)
+                return
+        else:
+            self.driver.get(course_url)
+            self.manual_login(man_login_url)
+
+        logger.info("Starting download of course: " + course_url)
+
         try:
-            current_url = self.driver.current_url
-            if self.driver.find_elements(By.ID, "email") and self.driver.find_elements(By.ID, "password"):
-                return "sign-in form (email + password fields) present"
-            if re.search(r"/sign_in|/identity/login", current_url):
-                return "current URL looks like a sign-in/OTP page"
-            if self.driver.find_elements(By.LINK_TEXT, "Login"):
-                return "'Login' link present on the page"
-            if "content locked" in self.driver.page_source.lower():
-                return "'content locked' message present"
+            self.pick_course_downloader(course_url)
         except Exception as e:
-            logging.warning("logged_out_reason: could not inspect page: " + str(e))
-            return "could not read browser state (" + str(e) + ")"
-        return None
+            logger.error(
+                "Could not download course: " + course_url + " cause: " + str(e)
+            )
 
-    def wait_for_manual_login(self, start_url):
-        logging.info("Manual login mode: waiting for you to log in.")
-        if self.driver.current_url != start_url:
-            self.driver.get(start_url)
+    def run_batch(self, url_list, email, password, login_url, man_login_url):
+        """
+        This method handles batch downloading of courses. It navigates to the given URLs, logs in if necessary,
+        and initiates the download process for each course.
 
-        print(
-            "\033[93mManual login mode: please log in yourself in the browser window (enter your email/password "
-            "and solve the captcha if one appears). The download will start automatically once you're logged "
-            "in.\033[0m"
-        )
+        :param url_list: List[str]
+            An array of URLs pointing to the courses that need to be downloaded.
+        :param email: str
+            The email address used to log in to the platform.
+        :param password: str
+            The password associated with the provided email address.
+        :param login_url: str
+            The URL of the login page. If not provided, manual login is assumed.
+        :param man_login_url: str
+            The URL of the page to navigate to after manual login. This parameter is optional.
+            If provided, the script will wait until the user has manually navigated to this URL
+            before starting the download process.
+        :return: None
+        """
+        logger.info("Starting login")
 
-        poll_count = 0
-        while True:
-            logging.debug(f"wait_for_manual_login: poll #{poll_count + 1}")
-            reason = self.logged_out_reason()
-            if not reason:
-                break
-            poll_count += 1
-            if poll_count % 5 == 0:
-                logging.info(f"Still waiting ({reason}); current url: {self.driver.current_url}")
-            time.sleep(3)
+        if not man_login_url:
+            # Check if login_url is not set
+            if login_url:
+                self.driver.get(login_url)
+            else:
+                logger.error("Login url is not set")
+                return
 
-        # logged_out_reason() can return None a moment before the browser
-        # finishes redirecting to the final course page, so wait for the URL
-        # to stop changing, then force a clean reload - otherwise the
-        # downloader can grab elements from a DOM that's still mid-navigation
-        # and hit stale element errors.
-        previous_url = None
-        current_url = self.driver.current_url
-        for _ in range(self.global_timeout * 2):
-            if current_url == previous_url:
-                break
-            previous_url = current_url
-            time.sleep(0.5)
-            current_url = self.driver.current_url
+            try:
+                self.login(email, password)
+            except Exception as e:
+                logger.error("Could not login: " + str(e), exc_info=self.verbose)
+                return
+        else:
+            self.driver.get(url_list[0])
+            self.manual_login(man_login_url)
 
-        logging.info("Manual login detected, reloading course page before starting download.")
-        self.driver.get(start_url)
-        WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        logger.info("Running batch download of courses ")
+        for url in url_list:
+            try:
+                self.pick_course_downloader(url)
+            except Exception as e:
+                logger.error("Could not download course: " + url + " cause: " + str(e))
 
     def pick_course_downloader(self, course_url):
         # Check if we are already on the course page
-        if not self.driver.current_url == course_url:
-            logging.info("Switching to course page")
+        if self.driver.current_url != course_url:
+            logger.info("Switching to course page")
             self.driver.get(course_url)
-            if self.check_elem_exists(By.ID, "challenge-stage", timeout=self.global_timeout):
-                self.bypass_cloudflare()
+            self.bypass_cloudflare_if_present()
 
         WebDriverWait(self.driver, timeout=self.global_timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, 'body')))
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
 
         # https://support.teachable.com/hc/en-us/articles/360058715732-Course-Design-Templates
-        logging.info("Picking course downloader")
+        logger.info("Picking course downloader")
         if self.driver.find_elements(By.ID, "__next"):
-            logging.info('Choosing __next format')
+            logger.info("Choosing __next format")
             self.download_course_simple(course_url)
         elif self.driver.find_elements(By.CLASS_NAME, "course-mainbar"):
-            logging.info('Choosing course-mainbar format')
+            logger.info("Choosing course-mainbar format")
             self.download_course_classic(course_url)
         elif self.driver.find_elements(By.CSS_SELECTOR, ".block__curriculum"):
-            logging.info('Choosing .block__curriculum format')
+            logger.info("Choosing .block__curriculum format")
             self.download_course_colossal(course_url)
         else:
-            logging.error("Downloader does not support this course template. Please open an issue on github.")
+            logger.error(
+                "Downloader does not support this course template. Please open an issue on github."
+            )
+            return
 
     def download_course_colossal(self, course_url):
-        logging.info("Detected block course format")
-        try:
-            logging.info("Getting course title")
-            course_title = WebDriverWait(self.driver, self.global_timeout).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".course__title"))
-            ).text
-        except Exception as e:
-            logging.warning("Could not get course title, using tab title instead")
-            course_title = self.driver.title
-
-        course_title = clean_string(course_title)
+        logger.info("Detected block course format")
+        course_title = self.get_course_title(
+            course_url, By.CSS_SELECTOR, ".course__title"
+        )
         course_path = create_folder(course_title)
 
-        logging.info("Saving course html")
-        try:
-            output_file = os.path.join(course_path, "course.html")
-            with open(output_file, 'w+') as f:
-                f.write(self.driver.page_source)
-        except Exception as e:
-            logging.error("Could not save course html: " + str(e), exc_info=self.verbose)
+        self.save_course_html(course_path)
 
         # Unhide all elements
-        logging.info("Unhiding all elements")
-        self.driver.execute_script('[...document.querySelectorAll(".hidden")].map(e=>e.classList.remove("hidden"))')
+        logger.info("Unhiding all elements")
+        self.driver.execute_script(
+            '[...document.querySelectorAll(".hidden")].map(e=>e.classList.remove("hidden"))'
+        )
 
         chapter_idx = 1
         video_list = []
-        sections = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".block__curriculum__section"))
+        wait = WebDriverWait(self.driver, timeout=self.global_timeout)
+        sections = wait.until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, ".block__curriculum__section")
+            )
         )
-
         for section in sections:
-            chapter_title = section.find_element(By.CSS_SELECTOR, ".block__curriculum__section__title").text
+            chapter_title = section.find_element(
+                By.CSS_SELECTOR, ".block__curriculum__section__title"
+            ).text
             chapter_title = clean_string(chapter_title)
-            chapter_title = "{:02d}-{}".format(chapter_idx, chapter_title)
-            logging.info("Found chapter: " + chapter_title)
+            chapter_title = f"{chapter_idx:02d}-{chapter_title}"
+            logger.info("Found chapter: " + chapter_title)
 
             download_path = os.path.join(course_path, chapter_title)
             os.makedirs(download_path, exist_ok=True)
@@ -447,80 +360,44 @@ class TeachableDownloader:
             chapter_idx += 1
             idx = 1
 
-            section_items = section.find_elements(By.CSS_SELECTOR, ".block__curriculum__section__list__item__link")
-            for section_item in section_items:
-                lecture_link = section_item.get_attribute("href")
-
-                lecture_title = section_item.find_element(By.CSS_SELECTOR,
-                                                          ".block__curriculum__section__list__item__lecture-name").text
+            section_items = section.find_elements(
+                By.CSS_SELECTOR, ".block__curriculum__section__list__item__link"
+            )
+            for item in section_items:
+                lecture_link = item.get_attribute("href")
+                lecture_title = item.find_element(
+                    By.CSS_SELECTOR,
+                    ".block__curriculum__section__list__item__lecture-name",
+                ).text
                 lecture_title = clean_string(lecture_title)
-                lecture_title = ''.join(char for char in lecture_title if char in string.printable)
-                logging.info("Found lecture: " + lecture_title)
+                lecture_title = "".join(
+                    char for char in lecture_title if char in string.printable
+                )
+                logger.info("Found lecture: " + lecture_title)
 
-                truncated_lecture_title = truncate_title_to_fit_file_name(lecture_title)
-
-                video_entity = {"link": lecture_link, "title": truncated_lecture_title, "idx": idx,
-                                "download_path": download_path}
+                truncated_lecture_title = truncate_title_to_fit_filename(lecture_title)
+                video_entity = {
+                    "link": lecture_link,
+                    "title": truncated_lecture_title,
+                    "download_path": download_path,
+                    "idx": idx,
+                }
                 video_list.append(video_entity)
                 idx += 1
 
         self.download_videos_from_links(video_list)
 
     def download_course_classic(self, course_url):
-        # self.driver.find_elements(By.CLASS_NAME, "course-mainbar")
-        logging.info("Detected _mainbar course format")
-        try:
-            logging.debug("Getting course title")
-            course_title = WebDriverWait(self.driver, self.global_timeout).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "body > section > div.course-sidebar > div > h2"))
-            ).text
-        except Exception as e:
-            logging.warning("Could not get course title, using tab title instead")
-            course_title = self.driver.title
-
-        logging.debug("Found course title: \"" + course_title + "\" starting cleaning of title string")
-        course_title = clean_string(course_title)
-        logging.info("Found course title: " + course_title)
+        logger.info("Detected _mainbar course format")
+        course_title = self.get_course_title(
+            course_url,
+            By.CSS_SELECTOR,
+            "body > section > div.course-sidebar > div > h2",
+        )
         course_path = create_folder(course_title)
 
-        try:
-            logging.debug("Saving course html")
-            output_file = os.path.join(course_path, "course.html")
-            with open(output_file, 'w+', encoding="utf-8") as f:
-                f.write(self.driver.page_source)
-        except Exception as e:
-            logging.error("Could not save course html: " + str(e), exc_info=self.verbose)
-
-        # Get course image
-
-        try:
-            image_element = self.driver.find_elements(By.CLASS_NAME, "course-image")
-            logging.info("Found course image")
-            image_link = image_element[0].get_attribute("src")
-            image_link_hd = re.sub(r"/resize=.+?/", "/", image_link)
-            # try to download the image using the modified link first
-            response = requests.get(image_link_hd)
-            if response.ok:
-                # save the image to disk
-                image_path = os.path.join(course_path, "course-image.jpg")
-                with open(image_path, "wb") as f:
-                    f.write(response.content)
-                logging.info("Image downloaded successfully.")
-            else:
-                # try to download the image using the original link
-                response = requests.get(image_link)
-                if response.ok:
-                    # save the image to disk
-                    image_path = os.path.join(course_path, "course-image.jpg")
-                    with open(image_path, "wb") as f:
-                        f.write(response.content)
-                    logging.info("Image downloaded successfully.")
-                else:
-                    # print a message indicating that the image download failed
-                    logging.warning("Failed to download image.")
-        except Exception as e:
-            logging.warning("Could not find course image: " + str(e))
-            pass
+        self.save_course_html(course_path)
+        self.get_course_image(course_path, By.CLASS_NAME, "course-image")
 
         chapter_idx = 1
         video_list = []
@@ -530,8 +407,8 @@ class TeachableDownloader:
         for section in sections:
             chapter_title = section.find_element(By.CSS_SELECTOR, ".section-title").text
             chapter_title = clean_string(chapter_title)
-            chapter_title = chapter_title = "{:02d}-{}".format(chapter_idx, chapter_title)
-            logging.info("Found chapter: " + chapter_title)
+            chapter_title = f"{chapter_idx:02d}-{chapter_title}"
+            logger.info("Found chapter: " + chapter_title)
 
             download_path = os.path.join(course_path, chapter_title)
             os.makedirs(download_path, exist_ok=True)
@@ -540,91 +417,58 @@ class TeachableDownloader:
             idx = 1
 
             section_items = section.find_elements(By.CSS_SELECTOR, ".section-item")
-            for section_item in section_items:
-                lecture_link = section_item.find_element(By.CLASS_NAME, "item").get_attribute("href")
-
-                lecture_title = section_item.find_element(By.CLASS_NAME, "lecture-name").text
+            for item in section_items:
+                lecture_link = item.find_element(By.CLASS_NAME, "item").get_attribute(
+                    "href"
+                )
+                lecture_title = item.find_element(By.CLASS_NAME, "lecture-name").text
                 lecture_title = clean_string(lecture_title)
-                logging.info("Found lecture: " + lecture_title)
+                logger.info("Found lecture: " + lecture_title)
 
-                truncated_lecture_title = truncate_title_to_fit_file_name(lecture_title)
+                truncated_lecture_title = truncate_title_to_fit_filename(lecture_title)
 
-                video_entity = {"link": lecture_link, "title": truncated_lecture_title, "idx": idx,
-                                "download_path": download_path}
+                video_entity = {
+                    "link": lecture_link,
+                    "title": truncated_lecture_title,
+                    "download_path": download_path,
+                    "idx": idx,
+                }
                 video_list.append(video_entity)
                 idx += 1
 
         self.download_videos_from_links(video_list)
 
-    def get_course_title_next(self, course_url):
-        if self.driver.current_url != course_url:
-            self.driver.get(course_url)
-
-        wrap = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".wrap")))
-        heading = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".heading")))
-        course_title = heading.text
-
-        course_title = clean_string(course_title)
-        return course_title
-
     def download_course_simple(self, course_url):
         self.driver.implicitly_wait(2)
-        logging.info("Detected next course format")
-        course_title = self.get_course_title_next(course_url)
-        logging.info("Found course title: " + course_title)
+        logger.info("Detected next course format")
+        course_title = self.get_course_title_simple(course_url)
         course_path = create_folder(course_title)
 
-        output_file = os.path.join(course_path, "course.html")
-        try:
-            with open(output_file, 'w+', encoding='utf-8') as f:
-                f.write(self.driver.page_source)
-        except Exception as e:
-            logging.error("Could not save course html: " + str(e), exc_info=self.verbose)
-
-        # Download course image
-        try:
-            logging.info("Downloading course image")
-            image_element = self.driver.find_element(By.XPATH, "//*[@id=\"__next\"]/div/div/div[2]/div/div[1]/img")
-            logging.info("Found course image")
-            image_link = image_element.get_attribute("src")
-            # Save image
-            image_path = os.path.join(course_path, "course-image.jpg")
-            # send a GET request to the image link
-            try:
-                response = requests.get(image_link)
-                # write the image data to a file
-                with open(image_path, "wb") as f:
-                    f.write(response.content)
-                # print a message indicating that the image was downloaded
-                logging.info("Image downloaded successfully.")
-            except Exception as e:
-                # print a message indicating that the image download failed
-                logging.warning("Failed to download image:" + str(e))
-        except Exception as e:
-            logging.warning("Could not find course image: " + str(e))
-            pass
+        self.save_course_html(course_path)
+        self.get_course_image(
+            course_path, By.XPATH, '//*[@id="__next"]/div/div/div[2]/div/div[1]/img'
+        )
 
         chapter_idx = 0
         video_list = []
         slim_sections = self.driver.find_elements(By.CSS_SELECTOR, ".slim-section")
-        for slim_section in slim_sections:
+        for section in slim_sections:
             chapter_idx += 1
-            bars = slim_section.find_elements(By.CSS_SELECTOR, ".bar")
-            chapter_title = slim_section.find_element(By.CSS_SELECTOR, ".heading").text
+            bars = section.find_elements(By.CSS_SELECTOR, ".bar")
+            chapter_title = section.find_element(By.CSS_SELECTOR, ".heading").text
             chapter_title = clean_string(chapter_title)
-            chapter_title = "{:02d}-{}".format(chapter_idx, chapter_title)
-            logging.info("Found chapter: " + chapter_title)
+            chapter_title = f"{chapter_idx:02d}-{chapter_title}"
+            logger.info("Found chapter: " + chapter_title)
 
             try:
-                not_available_element = WebDriverWait(slim_section, self.global_timeout).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".drip-tag")))
-                logging.warning('Chapter "%s" not available, skipping', chapter_title)
+                WebDriverWait(section, self.global_timeout).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".drip-tag"))
+                )
+                logger.warning('Chapter "%s" not available, skipping', chapter_title)
                 continue
             except TimeoutException:
-                logging.info("Chapter is available")
-                pass  # Element wasn't found so the chapter is available
+                logger.info("Chapter is available")
+                # Element wasn't found so the chapter is available
 
             download_path = os.path.join(course_path, chapter_title)
             os.makedirs(download_path, exist_ok=True)
@@ -635,122 +479,294 @@ class TeachableDownloader:
                 link = video.get_attribute("href")
                 # Remove new line characters from the title and replace spaces with -
                 title = clean_string(video.text)
-                logging.info("Found lecture: " + title)
-                truncated_title = truncate_title_to_fit_file_name(title)
-                video_entity = {"link": link, "title": truncated_title, "idx": idx, "download_path": download_path}
+                logger.info("Found lecture: " + title)
+                truncated_title = truncate_title_to_fit_filename(title)
+                video_entity = {
+                    "link": link,
+                    "title": truncated_title,
+                    "download_path": download_path,
+                    "idx": idx,
+                }
                 video_list.append(video_entity)
                 idx += 1
 
         self.download_videos_from_links(video_list)
 
+    def get_course_title(self, course_url, by, selector):
+        if self.driver.current_url != course_url:
+            self.driver.get(course_url)
+        try:
+            logger.info("Getting course title")
+            course_title = (
+                WebDriverWait(self.driver, self.global_timeout)
+                .until(EC.presence_of_element_located((by, selector)))
+                .text
+            )
+        except Exception:
+            logger.warning("Could not get course title, using tab title instead")
+            course_title = self.driver.title
+        return clean_string(course_title)
+
+    def get_course_title_simple(self, course_url):
+        if self.driver.current_url != course_url:
+            self.driver.get(course_url)
+        WebDriverWait(self.driver, self.global_timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".wrap"))
+        )
+        heading = WebDriverWait(self.driver, self.global_timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".heading"))
+        )
+        course_title = heading.text
+        return clean_string(course_title)
+
+    def save_course_image(self, course_path, image_src):
+        try:
+            response = requests.get(image_src, timeout=30)
+        except Exception as e:
+            logger.warning("Could not download course image: " + str(e))
+            return False
+
+        if not response.ok:
+            logger.warning("Failed to download image.")
+            return False
+
+        # save the image to disk
+        image_path = os.path.join(course_path, "course-image.jpg")
+        with open(image_path, "wb") as f:
+            f.write(response.content)
+        logger.info("Image downloaded successfully.")
+        return True
+
+    def get_course_image(self, course_path, by, selector):
+        image_element = self.driver.find_elements(by, selector)
+
+        if not image_element:
+            logger.warning("No course image element found")
+            return
+
+        try:
+            logger.info("Found course image")
+            image_src = image_element[0].get_attribute("src")
+            # Try the high-definition version first, falling back to the
+            # original link if that fails for any reason.
+            image_src_hd = re.sub(r"/resize=.+?/", "/", image_src)
+            if self.save_course_image(course_path, image_src_hd):
+                return
+            self.save_course_image(course_path, image_src)
+        except Exception as e:
+            logger.warning("Could not find course image: " + str(e))
+
+    def save_course_html(self, course_path):
+        try:
+            logger.debug("Saving course html")
+            output_file = os.path.join(course_path, "course.html")
+            with open(output_file, "w+", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+        except Exception as e:
+            logger.error("Could not save course html: " + str(e), exc_info=self.verbose)
+
     def download_videos_from_links(self, video_list):
         for video in video_list:
-            if self.driver.current_url != video["link"]:
-                logging.info("Navigating to lecture: " + video["title"])
-                self.driver.get(video["link"])
+            link = video["link"]
+            title = video["title"]
+            download_path = video["download_path"]
+            idx = video["idx"]
+
+            if self.driver.current_url != link:
+                logger.info("Navigating to lecture: " + title)
+                self.driver.get(link)
                 self.driver.implicitly_wait(self.global_timeout)
-            logging.info("Downloading lecture: " + video["title"])
-
-            # logging.info("Disabling autoplay")
-            # self.driver.execute_script('var checkbox = document.getElementById("custom-toggle-autoplay");'
-            #                            'if (checkbox.checked) {checkbox.click();}')
+            logger.info("Downloading lecture: " + title)
 
             try:
-                logging.info("Saving html")
-                self.save_webpage_as_html(video["title"], video["idx"], video["download_path"])
+                logger.info("Saving html")
+                self.save_webpage_as_html(title, idx, download_path)
             except Exception as e:
-                logging.error("Could not save html: " + video["title"] + " cause: " + str(e), exc_info=self.verbose)
+                logger.error(
+                    "Could not save html: " + title + " cause: " + str(e),
+                    exc_info=self.verbose,
+                )
 
             try:
-                logging.info("Downloading attachments")
-                self.download_attachments(video["link"], video["title"], video["idx"], video["download_path"])
+                logger.info("Downloading attachments")
+                self.download_attachments(link, title, idx, download_path)
             except Exception as e:
-                logging.warning("Could not download attachments: " + video["title"] + " cause: " + str(e))
-            
+                logger.warning(
+                    "Could not download attachments: " + title + " cause: " + str(e)
+                )
+
             try:
-                logging.debug("Trying to download video as an attachment")
-                if self.download_video_file(video["title"], video["idx"], video["download_path"]):
+                logger.debug("Trying to download video as an attachment")
+                if self.download_video_file(title, idx, download_path):
                     continue
-
             except Exception as e:
-                logging.debug("Could not download video as an attachment: " + video["title"] + " cause: " + str(e))
+                logger.debug(
+                    "Could not download video as an attachment: "
+                    + title
+                    + " cause: "
+                    + str(e)
+                )
 
-            video_iframes = self.driver.find_elements(By.XPATH, "//iframe[starts-with(@data-testid, 'embed-player')]")
+            video_iframes = self.driver.find_elements(
+                By.XPATH, "//iframe[starts-with(@data-testid, 'embed-player')]"
+            )
 
             for i, iframe in enumerate(video_iframes):
                 try:
-                    logging.info("Switching to video frame")
+                    logger.info("Switching to video frame")
                     self.driver.switch_to.frame(iframe)
 
                     script_text = self.driver.find_element(By.ID, "__NEXT_DATA__")
                     json_text = json.loads(script_text.get_attribute("innerHTML"))
-                    link = json_text["props"]["pageProps"]["applicationData"]["mediaAssets"][0]["urlEncrypted"]
+                    url_encrypted = json_text["props"]["pageProps"]["applicationData"][
+                        "mediaAssets"
+                    ][0]["urlEncrypted"]
 
                     # Append -n to the video title if there are multiple iframes
-                    video_title = video["title"] + ("-" + str(i + 1) if len(video_iframes) > 1 else "")
+                    video_title = title + (
+                        "-" + str(i + 1) if len(video_iframes) > 1 else ""
+                    )
 
                     try:
-                        logging.info("Downloading subtitle")
-                        self.download_subtitle(link, video_title, video["idx"], video["download_path"])
+                        logger.info("Downloading subtitle")
+                        self.download_subtitle(
+                            url_encrypted, video_title, idx, download_path
+                        )
                     except Exception as e:
-                        logging.warning("Could not download subtitle: " + video_title + " cause: " + str(e))
+                        logger.warning(
+                            "Could not download subtitle: "
+                            + video_title
+                            + " cause: "
+                            + str(e)
+                        )
 
                     try:
-                        logging.info("Downloading video")
-                        self.download_video(link, video_title, video["idx"], video["download_path"])
+                        logger.info("Downloading video")
+                        self.download_video(
+                            url_encrypted, video_title, idx, download_path
+                        )
                     except Exception as e:
-                        logging.warning("Could not download video: " + video_title + " cause: " + str(e))
+                        logger.warning(
+                            "Could not download video: "
+                            + video_title
+                            + " cause: "
+                            + str(e)
+                        )
 
                     self.driver.switch_to.default_content()  # Switch back to main content before the next iteration
 
-                except Exception as e:
-                    logging.warning("Could not find video: " + video["title"])
+                except Exception:
+                    logger.warning("Could not find video: " + title)
                     continue
 
-            logging.info("Downloaded video: " + video["title"])
+            logger.info("Downloaded video: " + title)
 
             if self._complete_lecture:
                 try:
-                    logging.info("Completing lecture")
+                    logger.info("Completing lecture")
                     self.complete_lecture()
                 except Exception as e:
-                    logging.warning("Could not complete lecture: " + video["title"] + " cause: " + str(e))
+                    logger.warning(
+                        "Could not complete lecture: "
+                        + video["title"]
+                        + " cause: "
+                        + str(e)
+                    )
 
-        return
+    def save_webpage_as_html(self, title, video_index, output_path):
+        output_file = os.path.join(output_path, f"{video_index:02d}-{title}.html")
+        with open(output_file, "w+", encoding="utf-8") as f:
+            f.write(self.driver.page_source)
+        logger.info("Saved webpage as html: " + output_file)
 
-    def complete_lecture(self):
-        # Complete lecture
-        self.driver.switch_to.default_content()
-        complete_button = self.driver.find_element(By.ID, "lecture_complete_button")
-        if complete_button:
-            logging.info("Found complete button")
-            complete_button.click()
-            logging.info("Completed lecture")
-            time.sleep(3)
+    def download_attachments(self, link, title, video_index, output_path):
+        video_title = f"{video_index:02d}-{title}"
 
-    def download_video(self, link, title, video_index, output_path):
-        ydl_opts = {
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                },
-                {
-                    "key": "FFmpegMetadata",
-                },
-            ],
-            "http_headers": self.headers,
-            "concurrentfragments": 15,
-            "outtmpl": os.path.join(output_path, "{:02d}-{}.mp4".format(video_index, title)),
-            "verbose": self.verbose,
-        }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([link])
-        except Exception as e:
-            logging.error("Could not download video: " + title + " cause: " + str(e))
+        # Grab the video attachments type file
+        video_attachments = self.driver.find_elements(
+            By.CLASS_NAME, "lecture-attachment-type-file"
+        )
+        if video_attachments:
+            # Get all links from the video attachments
+            video_links = video_attachments[0].find_elements(By.TAG_NAME, "a")
+            output_path = os.path.join(output_path, video_title)
+            os.makedirs(output_path, exist_ok=True)
+
+            # Get href attribute from the first link
+            if video_links:
+                for video_link in video_links:
+                    link = video_link.get_attribute("href")
+                    filename = video_link.text
+                    logger.info(
+                        "Downloading attachment: " + filename + " for video: " + title
+                    )
+                    # Download file and save the file in output_path directory
+                    wget.download(link, out=output_path)
+        else:
+            logger.warning("No attachments found for video: " + title)
+
+    def download_video_file(self, title, video_index, output_path, timeout=60):
+        video_title = f"{video_index:02d}-{title}"
+
+        # Grab the video attachments type video
+        video_attachment = self.driver.find_element(
+            By.CLASS_NAME, "lecture-attachment-type-video"
+        )
+        if not video_attachment:
+            logger.debug(f"No video attachment found for lecture: {title}")
+            return False
+
+        video_link = video_attachment.find_element(By.TAG_NAME, "a")
+        if not video_link:
+            logger.debug(f"No video link found for lecture: {title}")
+            return False
+
+        # Set the download directory for this file
+        self.driver.execute_cdp_cmd(
+            "Page.setDownloadBehavior",
+            {
+                "behavior": "allow",
+                "downloadPath": output_path,
+            },
+        )
+        # Get list of files before download
+        files_before_download = set(os.listdir(output_path))
+
+        # Click the link to trigger download
+        video_link.click()
+
+        # Wait for download to complete
+        start_time = time.time()
+        while True:
+            files_after_download = set(os.listdir(output_path))
+
+            # Find new files
+            new_files = files_after_download - files_before_download
+
+            if len(new_files) > 0 and all(
+                os.path.splitext(f)[1] != ".crdownload" for f in new_files
+            ):
+                break
+
+            if timeout > 0 and (time.time() - start_time) > timeout:
+                logger.warning(f"Download timeout for lecture: {title}")
+                return False
+
+            time.sleep(1)
+
+        latest_file = os.path.join(output_path, next(iter(new_files)))
+
+        # Determine the file extension
+        _, extension = os.path.splitext(latest_file)
+
+        # Create the new filename
+        new_filename = f"{video_title}{extension}"
+        new_filepath = os.path.join(output_path, new_filename)
+
+        # Rename the file
+        os.rename(latest_file, new_filepath)
+        logger.info(f"Downloaded video file {new_filename}")
+        return True
 
     # This function is needed because yt-dlp subtitle downloader is not working
     def download_subtitle(self, link, title, video_index, output_path):
@@ -780,130 +796,86 @@ class TeachableDownloader:
                 info = ydl.extract_info(link, download=False)
                 info_json = ydl.sanitize_info(info)
         except Exception as e:
-            logging.warning("Could not download subtitle: " + title + " cause: " + str(e))
+            logger.warning(
+                "Could not download subtitle: " + title + " cause: " + str(e)
+            )
+            return
 
         subtitle_links = {}
         for lang, sub_info in info_json["requested_subtitles"].items():
-            subtitle_links[lang] = {"url": sub_info["url"], "ext": sub_info["ext"]}
+            subtitle_links[lang] = {
+                "url": sub_info["url"],
+                "ext": sub_info["ext"],
+            }
 
         # Print the subtitle links and language names
-        req = None
         for lang, sub in subtitle_links.items():
-            subtitle_filename = "{:02d}-{}.{}.{}".format(video_index, title, lang, sub["ext"])
+            subtitle_filename = "{:02d}-{}.{}.{}".format(
+                video_index, title, lang, sub["ext"]
+            )
             file_path = os.path.join(output_path, subtitle_filename)
             if os.path.isfile(file_path):
-                logging.info("Skipping existing subtitle: " + subtitle_filename)
+                logger.info("Skipping existing subtitle: " + subtitle_filename)
             else:
                 base_url = sub["url"]
                 try:
-                    req = requests.get(sub["url"], headers=self.headers)
+                    req = requests.get(sub["url"], headers=self.headers, timeout=30)
                 except Exception as e:
-                    logging.warning("Could not download subtitle: " + title + " cause: " + str(e))
+                    logger.warning(
+                        "Could not download subtitle: " + title + " cause: " + str(e)
+                    )
+                    continue
+
                 relative_path = req.text.split("\n")[5]
                 full_url = urljoin(base_url, relative_path)
                 try:
-                    response = requests.get(full_url, headers=self.headers)
+                    response = requests.get(full_url, headers=self.headers, timeout=30)
                     with open(file_path, "wb") as f:
                         f.write(response.content)
                 except Exception as e:
-                    logging.warning("Could not download subtitle: " + title + " cause: " + str(e))
-                logging.info("Downloaded subtitle: " + subtitle_filename)
-                
-    def download_video_file(self, title, video_index, output_path, timeout=-1):
-        video_title = "{:02d}-{}".format(video_index, title)
+                    logger.warning(
+                        "Could not download subtitle: " + title + " cause: " + str(e)
+                    )
+                    continue
 
-        # Grab the video attachments type video
-        video_attachment = self.driver.find_element(By.CLASS_NAME, "lecture-attachment-type-video")
+                logger.info("Downloaded subtitle: " + subtitle_filename)
 
-        if not video_attachment:
-            logging.debug(f"No video attachment found for lecture: {title}")
-            return False
+    def download_video(self, link, title, video_index, output_path):
+        ydl_opts = {
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            "postprocessors": [
+                {
+                    "key": "FFmpegVideoConvertor",
+                    "preferedformat": "mp4",
+                },
+                {
+                    "key": "FFmpegMetadata",
+                },
+            ],
+            "http_headers": self.headers,
+            "concurrentfragments": 15,
+            "outtmpl": os.path.join(output_path, f"{video_index:02d}-{title}.mp4"),
+            "verbose": self.verbose,
+        }
 
-        video_link = video_attachment.find_element(By.TAG_NAME, "a")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([link])
+        except Exception as e:
+            logger.error("Could not download video: " + title + " cause: " + str(e))
 
-        if not video_link:
-            logging.debug(f"No video link found for lecture: {title}")
-            return False
+    def complete_lecture(self):
+        self.driver.switch_to.default_content()
+        complete_button = self.driver.find_element(By.ID, "lecture_complete_button")
+        if complete_button:
+            logger.info("Found complete button")
+            complete_button.click()
+            logger.info("Completed lecture")
+            time.sleep(3)
 
-        # Set the download directory for this file
-        self.driver.execute_cdp_cmd("Page.setDownloadBehavior", {
-            "behavior": "allow",
-            "downloadPath": output_path
-        })
-        # Get list of files before download
-        files_before_download = set(os.listdir(output_path))
-
-        # Click the link to trigger download
-        video_link.click()
-
-        # Wait for download to complete
-        start_time = time.time()
-        while True:
-            files_after_download = set(os.listdir(output_path))
-
-            # Find new files
-            new_files = files_after_download - files_before_download
-
-            if len(new_files) == 1 and not list(new_files)[0].endswith('.crdownload'):
-                break
-            
-            if timeout > 0 and (time.time() - start_time) > timeout:
-                logging.warning(f"Download timeout for lecture: {title}")
-                return False
-        
-            time.sleep(1)
-
-        latest_file = os.path.join(output_path, list(new_files)[0])
-                
-        # Determine the file extension
-        _, extension = os.path.splitext(latest_file)
-        
-        # Create the new filename
-        new_filename = f"{video_title}{extension}"
-        new_filepath = os.path.join(output_path, new_filename)
-        
-        # Rename the file
-        os.rename(latest_file, new_filepath)
-        logging.info(f"Downloaded video file {new_filename}")
-        return True
-    
-    def download_attachments(self, link, title, video_index, output_path):
-        video_title = "{:02d}-{}".format(video_index, title)
-
-        # Grab the video attachments type file
-        video_attachments = self.driver.find_elements(By.CLASS_NAME, "lecture-attachment-type-file")
-        # Get all links from the video attachments
-
-        if video_attachments:
-            video_links = video_attachments[0].find_elements(By.TAG_NAME, "a")
-
-            output_path = os.path.join(output_path, video_title)
-            os.makedirs(output_path, exist_ok=True)
-
-            # Get href attribute from the first link
-            if video_links:
-                for video_link in video_links:
-                    link = video_link.get_attribute("href")
-                    file_name = video_link.text
-                    logging.info("Downloading attachment: " + file_name + " for video: " + title)
-                    # Download file and save the file in output_path directory
-                    wget.download(link, out=output_path)
-        else:
-            logging.warning("No attachments found for video: " + title)
-
-    def save_webpage_as_html(self, title, video_index, output_path):
-        output_file = os.path.join(output_path, "{:02d}-{}.html".format(video_index, title))
-        with open(output_file, 'w+', encoding='utf-8') as f:
-            f.write(self.driver.page_source)
-        logging.info("Saved webpage as html: " + output_file)
-
-    def save_webpage_as_pdf(self, title, video_index, output_path):
-        output_file_pdf = os.path.join(output_path, "{:02d}-{}.pdf".format(video_index, title))
-        self.driver.save_print_page(output_file_pdf)
-        logging.info("Saved webpage as pdf: " + output_file_pdf)
-
-    def clean_up(self):
-        logging.info("Cleaning up")
+    def cleanup(self):
+        logger.info("Cleaning up")
         self.driver.quit()
         # Delete cookies.txt
         if os.path.exists("cookies.txt"):
@@ -936,27 +908,38 @@ def read_batch_file(file_path):
     Returns a list of dicts with url, email, password and login_url keys; missing values are None.
     """
     try:
-        with open(file_path, 'r', newline='') as file:
-            lines = [line for line in file.read().splitlines()
-                     if line.strip() and not line.lstrip().startswith('#')]
+        with open(file_path, "r", newline="") as file:
+            lines = [
+                line
+                for line in file.read().splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
     except FileNotFoundError:
-        logging.error(f"File not found: {file_path}")
+        logger.error(f"File not found: {file_path}")
         return []
     except OSError as e:
-        logging.error(f"Could not read file: {file_path}. Error: {str(e)}")
+        logger.error(f"Could not read file: {file_path}. Error: {e!s}")
         return []
 
-    if lines and lines[0].split(',')[0].strip().lower() == 'url':
+    if lines and lines[0].split(",")[0].strip().lower() == "url":
         rows = csv.DictReader(lines, skipinitialspace=True)
-        entries = [{field: (row.get(field) or '').strip() or None for field in BATCH_FILE_FIELDS} for row in rows]
+        entries = [
+            {
+                field: (row.get(field) or "").strip() or None
+                for field in BATCH_FILE_FIELDS
+            }
+            for row in rows
+        ]
     else:
-        entries = [dict.fromkeys(BATCH_FILE_FIELDS) | {"url": line.strip()} for line in lines]
+        entries = [
+            dict.fromkeys(BATCH_FILE_FIELDS) | {"url": line.strip()} for line in lines
+        ]
     entries = [entry for entry in entries if entry["url"]]
 
     if entries:
-        logging.info(f"Successfully read {len(entries)} courses from file: {file_path}")
+        logger.info(f"Successfully read {len(entries)} courses from file: {file_path}")
     else:
-        logging.warning(f"No courses found in file: {file_path}")
+        logger.warning(f"No courses found in file: {file_path}")
 
     return entries
 
@@ -971,24 +954,61 @@ def check_required_args(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(prog='Teachable-Dl', description='Download courses', )
-    parser.add_argument("--url", required=False, help='URL of the course')
-    parser.add_argument("-e", "--email", required=False, help='Email of the account')
-    parser.add_argument("-p", "--password", required=False, help='Password of the account')
-    parser.add_argument('-v', '--verbose', action='count', default=0,
-                        help='Increase verbosity level (repeat for more verbosity)')
-    parser.add_argument('--complete-lecture', action='store_true', default=False,
-                        help='Complete the lecture after downloading')
-    parser.add_argument("--login_url", required=False, help='(Optional) URL to teachable SSO login page')
-    parser.add_argument("-ml", "--manual-login", action='store_true', default=False,
-                        help='Log in yourself in the browser (email/password and any captcha); '
-                             'the download starts automatically once you are logged in')
-    parser.add_argument("-f", "--file", required=False, help='Path to a text file with one URL per line, or a CSV file with a '
-                             'url,email,password,login_url header')
-    parser.add_argument("--user-agent", required=False, help='User agent to use when downloading videos',
-                        default="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/116.0.0.0 Safari/537.36")
-    parser.add_argument("-t", "--timeout", required=False, help='Timeout for selenium driver', type=int, default=10)
+    parser = argparse.ArgumentParser(
+        prog="Teachable-Dl",
+        description="Download courses",
+    )
+    parser.add_argument("--url", required=False, help="URL of the course")
+    parser.add_argument("-e", "--email", required=False, help="Email of the account")
+    parser.add_argument(
+        "-p", "--password", required=False, help="Password of the account"
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity level (repeat for more verbosity)",
+    )
+    parser.add_argument(
+        "--complete-lecture",
+        action="store_true",
+        default=False,
+        help="Complete the lecture after downloading",
+    )
+    parser.add_argument(
+        "--login_url", required=False, help="(Optional) URL to teachable SSO login page"
+    )
+    parser.add_argument(
+        "-ml",
+        "--manual-login",
+        action="store_true",
+        default=False,
+        help="Log in yourself in the browser (email/password and any captcha); "
+        "the download starts automatically once you are logged in",
+    )
+    parser.add_argument(
+        "-f",
+        "--file",
+        required=False,
+        help="Path to a text file with one URL per line, or a CSV file with a "
+        "url,email,password,login_url header",
+    )
+    parser.add_argument(
+        "--user-agent",
+        required=False,
+        help="User agent to use when downloading videos",
+        default="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/116.0.0.0 Safari/537.36",
+    )
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        required=False,
+        help="Timeout for selenium driver",
+        type=int,
+        default=10,
+    )
     args = parser.parse_args()
     verbose = False
     if args.verbose == 0:
@@ -999,43 +1019,60 @@ if __name__ == "__main__":
         verbose = True
         log_level = logging.DEBUG
 
-    logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
+    logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
 
     if not check_required_args(args):
-        logging.error("Required arguments are missing. Choose email/password or --manual-login.")
+        logger.error(
+            "Required arguments are missing. Choose email/password or --manual-login."
+        )
         exit(1)
 
-    downloader = TeachableDownloader(verbose_arg=verbose, complete_lecture_arg=args.complete_lecture,
-                                     user_agent_arg=args.user_agent, timeout_arg=args.timeout)
+    downloader = TeachableDownloader(
+        verbose_arg=verbose,
+        complete_lecture_arg=args.complete_lecture,
+        user_agent_arg=args.user_agent,
+        timeout_arg=args.timeout,
+    )
     if args.file:
         entries = read_batch_file(args.file)
         try:
-            downloader.run_batch(entries, args.email, args.password, args.login_url, manual_login=args.manual_login)
+            downloader.run_batch(
+                entries,
+                args.email,
+                args.password,
+                args.login_url,
+                manual_login=args.manual_login,
+            )
             downloader.clean_up()
             sys.exit(0)
         except KeyboardInterrupt:
-            logging.error("Interrupted by user")
+            logger.error("Interrupted by user")
             downloader.clean_up()
             sys.exit(1)
         except Exception as e:
-            logging.error("Error: " + str(e))
+            logger.error("Error: " + str(e))
             downloader.clean_up()
             sys.exit(1)
     else:
         # Check if url argument is passed
         if not args.url:
-            logging.error("URL is required")
+            logger.error("URL is required")
             sys.exit(1)
         try:
-            downloader.run(course_url=args.url, email=args.email, password=args.password, login_url=args.login_url,
-                           manual_login=args.manual_login)
+            downloader.run(
+                course_url=args.url,
+                email=args.email,
+                password=args.password,
+                login_url=args.login_url,
+                manual_login=args.manual_login,
+            )
             downloader.clean_up()
             sys.exit(0)
         except KeyboardInterrupt:
-            logging.error("Interrupted by user")
+            logger.error("Interrupted by user")
             downloader.clean_up()
             sys.exit(1)
         except Exception as e:
-            logging.error("Error: " + str(e))
+            logger.error("Error: " + str(e))
             downloader.clean_up()
             sys.exit(1)
