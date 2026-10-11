@@ -1,7 +1,6 @@
 import argparse
 import base64
 import csv
-import glob
 import json
 import logging
 import os
@@ -26,37 +25,34 @@ logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = ("mp4", "mkv", "webm", "mov", "avi", "m4v")
 
+BATCH_FILE_FIELDS = ("url", "email", "password", "login_url")
+
 # Elements that download_videos_from_links() downloads from on a lecture page
 LECTURE_CONTENT_SELECTOR = (
     "[class*='lecture-attachment-type-'], iframe[data-testid^='embed-player']"
 )
 
+# The video player iframe, without an axis so it can be prefixed with // or descendant-or-self::
+EMBED_PLAYER_XPATH = "iframe[starts-with(@data-testid, 'embed-player')]"
+
+LOGIN_ERROR_SELECTOR = "div.toast, span.text-with-icon"
+
+# Characters that are not allowed (or awkward) in file and folder names
+FILENAME_REPLACEMENTS = str.maketrans({**dict.fromkeys('\n :/|?<>"\\', "-"), "*": ""})
+
 
 def create_folder(course_title):
-    root_path = os.path.abspath(os.getcwd())
-    course_path = os.path.join(root_path, "courses", course_title)
+    course_path = os.path.join(os.getcwd(), "courses", course_title)
     os.makedirs(course_path, exist_ok=True)
     return course_path
 
 
 def clean_string(data):
-    logger.debug("Cleaning string: " + data)
-    # Remove all non-ASCII characters (including emojis)
+    logger.debug(f"Cleaning string: {data}")
+    # Remove all non-ASCII characters (including emojis) and non-printable ones
     data = data.encode("ascii", "ignore").decode("ascii")
-    # Replace specific characters with "-"
-    return (
-        data.replace("\n", "-")
-        .replace(" ", "-")
-        .replace(":", "-")
-        .replace("/", "-")
-        .replace("|", "-")
-        .replace("*", "")
-        .replace("?", "-")
-        .replace("<", "-")
-        .replace(">", "-")
-        .replace('"', "-")
-        .replace("\\", "-")
-    )
+    data = "".join(char for char in data if char in string.printable)
+    return data.translate(FILENAME_REPLACEMENTS)
 
 
 def truncate_title_to_fit_filename(title, max_filename_length=250):
@@ -64,10 +60,77 @@ def truncate_title_to_fit_filename(title, max_filename_length=250):
     # truncate the title to accommodate the max used file extension length and lecture index prefix
     max_title_length = max_filename_length - len(".mp4.part-Frag0000.part") - 3
     if len(title) > max_title_length:
-        truncated_title = title[:max_title_length]
-        logger.warning("Truncating title: " + truncated_title)
-        return truncated_title
+        title = title[:max_title_length]
+        logger.warning(f"Truncating title: {title}")
     return title
+
+
+def lecture_name(video_index, title):
+    # Base name shared by a lecture's html snapshot, videos and attachment folder
+    return f"{video_index:02d}-{title}"
+
+
+def widget_video_title(title, widget_index, total_widgets):
+    # Append -n to the video title if the lecture has multiple videos
+    return f"{title}-{widget_index + 1}" if total_widgets > 1 else title
+
+
+def find_existing_video(output_path, name):
+    # The extension isn't known until download, so match on the name with video extensions only:
+    # ".*" would also match the lecture's own .html snapshot (same base name)
+    for ext in VIDEO_EXTENSIONS:
+        path = os.path.join(output_path, f"{name}.{ext}")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def skip_existing(path, label):
+    if os.path.isfile(path):
+        logger.info(f"Skipping existing {label}: {os.path.basename(path)}")
+        return True
+    return False
+
+
+def write_file(path, content):
+    # Write to a temporary file first so an interrupted write never leaves a partial file
+    # at path, which the existence checks would then skip
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    part_path = f"{path}.part"
+    with open(part_path, "wb") as f:
+        f.write(content)
+    os.replace(part_path, path)
+
+
+def is_placeholder(src):
+    return not src or src.startswith("data:")
+
+
+def image_download_target(image_index, loader_src, src):
+    """
+    Works out how to save a lecture content image. Returns (filename, url, base64_data), where
+    either url or base64_data is set, or (None, None, None) if there is nothing to save.
+    Shared by download_content_image() and is_lecture_already_saved() so their names match.
+    """
+    image_link = next((s for s in (loader_src, src) if not is_placeholder(s)), None)
+    if image_link:
+        filename = os.path.basename(urlparse(unquote(image_link)).path)
+        return filename or f"image-{image_index}.png", image_link, None
+
+    # No real URL, but Teachable sometimes inlines the full image as a data: URI
+    # (not just a blurred preview), so decode and save that instead
+    data_uri = loader_src if loader_src.startswith("data:") else src
+    match = re.match(
+        r"data:image/([a-zA-Z0-9.+-]+);base64,(.+)", data_uri or "", re.DOTALL
+    )
+    if not match:
+        return None, None, None
+    ext = match.group(1).replace("jpeg", "jpg")
+    return f"image-{image_index}.{ext}", None, match.group(2)
+
+
+def audio_attachment_filename(name, href):
+    return (name or "").strip() or os.path.basename(urlparse(href).path)
 
 
 class TeachableDownloader:
@@ -82,10 +145,12 @@ class TeachableDownloader:
     ):
         # external_pdf: download PDFs instead of opening them in Chrome's viewer
         self.driver = Driver(uc=True, headed=True, external_pdf=True)
+        # Selenium commands have no timeout by default, so a frozen browser would hang the
+        # script forever; bound each command so it raises instead
         try:
             self.driver.command_executor.client_config.timeout = 120
         except Exception as e:
-            logger.debug("Could not set a command executor timeout: " + str(e))
+            logger.debug(f"Could not set a command executor timeout: {e}")
         self.headers = {
             "User-Agent": user_agent_arg,
             "Origin": origin_arg or "https://player.hotmart.com",
@@ -95,48 +160,95 @@ class TeachableDownloader:
         self._complete_lecture = complete_lecture_arg
         self.global_timeout = timeout_arg
 
+    # --- Helpers ---
+
+    def wait_for(self, by, selector, timeout=None):
+        return WebDriverWait(self.driver, timeout or self.global_timeout).until(
+            EC.presence_of_element_located((by, selector))
+        )
+
+    def is_dead_session_error(self, e):
+        return (
+            isinstance(e, InvalidSessionIdException)
+            or "invalid session id" in str(e).lower()
+        )
+
+    def try_step(self, action, func, *args, level=logging.WARNING):
+        # Run one step, logging a failure instead of aborting the rest (unless the browser
+        # session itself is gone). Returns func's result, or False if it raised.
+        try:
+            return func(*args)
+        except Exception as e:
+            if self.is_dead_session_error(e):
+                raise
+            logger.log(level, f"Could not {action}: {e}", exc_info=self.verbose)
+            return False
+
+    def download_file(self, url, path, label, headers=None):
+        # Returns True if the file exists afterwards
+        if skip_existing(path, label):
+            return True
+
+        filename = os.path.basename(path)
+        logger.info(f"Downloading {label}: {filename}")
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            logger.warning(f"Could not download {label} {filename}: {e}")
+            return False
+        if not response.ok:
+            logger.warning(
+                f"Failed to download {label} {filename} (HTTP {response.status_code}): {url}"
+            )
+            return False
+
+        write_file(path, response.content)
+        return True
+
+    def save_page_html(self, path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.driver.page_source)
+        logger.info(f"Saved webpage as html: {path}")
+
+    # --- Cloudflare ---
+
     def bypass_cloudflare_if_present(self):
         if self.driver.find_elements(By.ID, "challenge-stage"):
             self.bypass_cloudflare()
         else:
-            logger.info("No need to bypass cloudflare")
+            logger.debug("No need to bypass cloudflare")
 
     def bypass_cloudflare(self):
-        if self.driver.capabilities["browserVersion"].split(".")[0] < "115":
+        if int(self.driver.capabilities["browserVersion"].split(".")[0]) < 115:
             return
         logger.info("Bypassing cloudflare")
         time.sleep(1)
 
         try:
-            self.driver.find_element(
-                By.ID, "challenge-stage"
-            ).click()  # make sure the challenge is focused
+            # make sure the challenge is focused
+            self.driver.find_element(By.ID, "challenge-stage").click()
+            # open page in new tab
             self.driver.execute_script(
-                '''window.open("''' + self.driver.current_url + """","_blank");"""
-            )  # open page in new tab
+                f'window.open("{self.driver.current_url}","_blank");'
+            )
             input(
                 "\033[93mWarning: Bypassing Cloudflare\nplease click on the captcha checkbox if not done already "
                 "and press enter to continue (do not close any of the tabs)\033[0m"
             )
-            self.driver.switch_to.window(
-                window_name=self.driver.window_handles[0]
-            )  # switch to first tab
-            self.driver.close()  # close first tab
-            self.driver.switch_to.window(
-                window_name=self.driver.window_handles[0]
-            )  # switch back to new tab
+            # close the first tab and switch to the new one
+            self.driver.switch_to.window(window_name=self.driver.window_handles[0])
+            self.driver.close()
+            self.driver.switch_to.window(window_name=self.driver.window_handles[0])
         except Exception as e:
-            logger.error("Could not bypass cloudflare: " + str(e))
-            return
+            logger.error(f"Could not bypass cloudflare: {e}")
+
+    # --- Login ---
 
     def construct_sign_in_url(self, course_url):
         parsed_url = urlparse(course_url)
-        # Replace the path with '/sign_in'
-        sign_in_path = "/sign_in"
-        fallback_url = urlunparse(
-            (parsed_url.scheme, parsed_url.netloc, sign_in_path, "", "", "")
+        return urlunparse(
+            (parsed_url.scheme, parsed_url.netloc, "/sign_in", "", "", "")
         )
-        return fallback_url
 
     def go_to_login_page(self, course_url):
         logger.info("Trying to find login")
@@ -181,7 +293,7 @@ class TeachableDownloader:
             (
                 parsed_url.scheme,
                 parsed_url.netloc,
-                match.group(1) + "/password",
+                f"{match.group(1)}/password",
                 "",
                 "force=true",
                 "",
@@ -191,9 +303,7 @@ class TeachableDownloader:
         self.driver.get(password_login_url)
 
     def follow_link(self, by, selector, timeout=None):
-        element = WebDriverWait(self.driver, timeout or self.global_timeout).until(
-            EC.presence_of_element_located((by, selector))
-        )
+        element = self.wait_for(by, selector, timeout)
         href = element.get_attribute("href")
         if href and not href.endswith("#"):
             self.driver.get(href)
@@ -202,22 +312,11 @@ class TeachableDownloader:
 
     def login(self, email, password):
         logger.info("Logging in")
-
         self.bypass_cloudflare_if_present()
 
-        WebDriverWait(self.driver, timeout=15).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-
-        email_element = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.ID, "email"))
-        )
-        password_element = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.ID, "password"))
-        )
-        commit_element = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.NAME, "commit"))
-        )
+        email_element = self.wait_for(By.ID, "email")
+        password_element = self.wait_for(By.ID, "password")
+        commit_element = self.wait_for(By.NAME, "commit")
 
         logger.debug("Filling in login form")
         email_element.click()
@@ -239,17 +338,13 @@ class TeachableDownloader:
         WebDriverWait(self.driver, self.global_timeout).until(
             EC.any_of(
                 EC.none_of(EC.url_contains("/identity/login")),
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "div.toast, span.text-with-icon")
-                ),
+                EC.presence_of_element_located((By.CSS_SELECTOR, LOGIN_ERROR_SELECTOR)),
                 EC.presence_of_element_located((By.NAME, "otp_code")),
             )
         )
 
         # Check for login error due to incorrect credentials
-        for element in self.driver.find_elements(
-            By.CSS_SELECTOR, "div.toast, span.text-with-icon"
-        ):
+        for element in self.driver.find_elements(By.CSS_SELECTOR, LOGIN_ERROR_SELECTOR):
             if "Your email or password is incorrect" in element.text:
                 raise RuntimeError("Incorrect email or password")
 
@@ -274,20 +369,19 @@ class TeachableDownloader:
         # message all mean we're not authenticated yet. Returns why, or None
         # if none of that applies.
         try:
-            current_url = self.driver.current_url
             if self.driver.find_elements(By.ID, "email") and self.driver.find_elements(
                 By.ID, "password"
             ):
                 return "sign-in form (email + password fields) present"
-            if re.search(r"/sign_in|/identity/login", current_url):
+            if re.search(r"/sign_in|/identity/login", self.driver.current_url):
                 return "current URL looks like a sign-in/OTP page"
             if self.driver.find_elements(By.LINK_TEXT, "Login"):
                 return "'Login' link present on the page"
             if "content locked" in self.driver.page_source.lower():
                 return "'content locked' message present"
         except Exception as e:
-            logger.warning("logged_out_reason: could not inspect page: " + str(e))
-            return "could not read browser state (" + str(e) + ")"
+            logger.warning(f"logged_out_reason: could not inspect page: {e}")
+            return f"could not read browser state ({e})"
         return None
 
     def wait_for_manual_login(self, start_url):
@@ -302,11 +396,7 @@ class TeachableDownloader:
         )
 
         poll_count = 0
-        while True:
-            logger.debug(f"wait_for_manual_login: poll #{poll_count + 1}")
-            reason = self.logged_out_reason()
-            if not reason:
-                break
+        while reason := self.logged_out_reason():
             poll_count += 1
             if poll_count % 5 == 0:
                 logger.info(
@@ -332,33 +422,50 @@ class TeachableDownloader:
             "Manual login detected, reloading course page before starting download."
         )
         self.driver.get(start_url)
-        WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        self.wait_for(By.TAG_NAME, "body")
 
-    def run(self, course_url, email, password, login_url, manual_login=False):
-        logger.info("Starting login")
+    def login_if_needed(self, course_url, email, password, login_url):
+        self.driver.get(course_url)
+        self.bypass_cloudflare_if_present()
 
+        if not self.logged_out_reason():
+            logger.info("Already logged in, skipping login")
+            return
+
+        if not email or not password:
+            raise ValueError("no email/password given for this course")
+
+        if login_url:
+            self.driver.get(login_url)
+        else:
+            self.go_to_login_page(course_url)
+        self.login(email, password)
+
+    def log_in(self, course_url, email, password, login_url, manual_login):
         if manual_login:
             self.wait_for_manual_login(course_url)
         else:
-            try:
-                if login_url:
-                    self.driver.get(login_url)
-                else:
-                    self.go_to_login_page(course_url)
-                self.login(email, password)
-            except Exception as e:
-                logger.error("Could not login: " + str(e), exc_info=self.verbose)
-                return
+            self.login_if_needed(course_url, email, password, login_url)
 
-        logger.info("Starting download of course: " + course_url)
-        try:
-            self.pick_course_downloader(course_url)
-        except Exception as e:
-            logger.error(
-                "Could not download course: " + course_url + " cause: " + str(e)
+    # --- Entry points ---
+
+    def run(self, course_url, email, password, login_url, manual_login=False):
+        logger.info("Starting login")
+        if (
+            self.try_step(
+                "login",
+                self.log_in,
+                course_url,
+                email,
+                password,
+                login_url,
+                manual_login,
+                level=logging.ERROR,
             )
+            is False
+        ):
+            return
+        self.download_course(course_url)
 
     def run_batch(self, entries, email, password, login_url, manual_login=False):
         """
@@ -379,10 +486,6 @@ class TeachableDownloader:
             starts automatically once they are logged in.
         :return: None
         """
-        if not entries:
-            logger.error("No courses to download")
-            return
-
         # Group courses by (site, account), keeping the order they first appear in
         groups = {}
         for entry in entries:
@@ -409,49 +512,35 @@ class TeachableDownloader:
                 self.driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
             current_email = group_email
 
-            try:
-                if manual_login:
-                    self.wait_for_manual_login(urls[0])
-                else:
-                    self.login_if_needed(
-                        urls[0], group_email, group["password"], group["login_url"]
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Could not login to {domain}: " + str(e), exc_info=self.verbose
+            if (
+                self.try_step(
+                    f"login to {domain}",
+                    self.log_in,
+                    urls[0],
+                    group_email,
+                    group["password"],
+                    group["login_url"],
+                    manual_login,
+                    level=logging.ERROR,
                 )
+                is False
+            ):
                 continue
 
             logger.info(f"Running batch download of courses for {domain}")
             for url in urls:
-                try:
-                    self.pick_course_downloader(url)
-                except Exception as e:
-                    if self.is_dead_session_error(e):
-                        logger.error(
-                            "Browser session was lost (crashed or closed), stopping."
-                        )
-                        return
-                    logger.error(
-                        "Could not download course: " + url + " cause: " + str(e)
-                    )
+                self.download_course(url)
 
-    def login_if_needed(self, course_url, email, password, login_url):
-        self.driver.get(course_url)
-        self.bypass_cloudflare_if_present()
+    def download_course(self, course_url):
+        logger.info(f"Starting download of course: {course_url}")
+        self.try_step(
+            f"download course {course_url}",
+            self.pick_course_downloader,
+            course_url,
+            level=logging.ERROR,
+        )
 
-        if not self.logged_out_reason():
-            logger.info("Already logged in, skipping login")
-            return
-
-        if not email or not password:
-            raise ValueError("no email/password given for this course")
-
-        if login_url:
-            self.driver.get(login_url)
-        else:
-            self.go_to_login_page(course_url)
-        self.login(email, password)
+    # --- Course pages ---
 
     def pick_course_downloader(self, course_url):
         # Check if we are already on the course page
@@ -460,9 +549,7 @@ class TeachableDownloader:
             self.driver.get(course_url)
             self.bypass_cloudflare_if_present()
 
-        WebDriverWait(self.driver, timeout=self.global_timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        self.wait_for(By.TAG_NAME, "body")
 
         # https://support.teachable.com/hc/en-us/articles/360058715732-Course-Design-Templates
         logger.info("Picking course downloader")
@@ -479,174 +566,132 @@ class TeachableDownloader:
             logger.error(
                 "Downloader does not support this course template. Please open an issue on github."
             )
-            return
+
+    def prepare_course(self, course_url, title_by, title_selector):
+        course_path = create_folder(
+            self.get_course_title(course_url, title_by, title_selector)
+        )
+        self.try_step(
+            "save course html",
+            self.save_page_html,
+            os.path.join(course_path, "course.html"),
+            level=logging.ERROR,
+        )
+        return course_path
+
+    def wait_for_sections(self, selector):
+        try:
+            return WebDriverWait(self.driver, self.global_timeout).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector))
+            )
+        except TimeoutException:
+            logger.warning(f"No chapters found ({selector})")
+            return []
+
+    def add_chapter(
+        self, video_list, course_path, chapter_idx, chapter_title, lectures
+    ):
+        # The chapter folder is created lazily in download_videos_from_links, once a
+        # lecture is actually about to be written into it
+        download_path = os.path.join(
+            course_path, f"{chapter_idx:02d}-{clean_string(chapter_title)}"
+        )
+        logger.info(f"Found chapter: {os.path.basename(download_path)}")
+        for idx, (link, title) in enumerate(lectures, start=1):
+            title = truncate_title_to_fit_filename(clean_string(title))
+            logger.info(f"Found lecture: {title}")
+            video_list.append(
+                {
+                    "link": link,
+                    "title": title,
+                    "download_path": download_path,
+                    "idx": idx,
+                }
+            )
 
     def download_course_colossal(self, course_url):
         logger.info("Detected block course format")
-        course_title = self.get_course_title(
-            course_url, By.CSS_SELECTOR, ".course__title"
-        )
-        course_path = create_folder(course_title)
-
-        self.save_course_html(course_path)
+        course_path = self.prepare_course(course_url, By.CSS_SELECTOR, ".course__title")
 
         # Unhide all elements
         logger.info("Unhiding all elements")
         self.driver.execute_script(
-            '[...document.querySelectorAll(".hidden")].map(e=>e.classList.remove("hidden"))'
+            '[...document.querySelectorAll(".hidden")].forEach(e => e.classList.remove("hidden"))'
         )
 
-        chapter_idx = 1
         video_list = []
-        wait = WebDriverWait(self.driver, timeout=self.global_timeout)
-        sections = wait.until(
-            EC.presence_of_all_elements_located(
-                (By.CSS_SELECTOR, ".block__curriculum__section")
-            )
-        )
-        for section in sections:
+        sections = self.wait_for_sections(".block__curriculum__section")
+        for chapter_idx, section in enumerate(sections, start=1):
             chapter_title = section.find_element(
                 By.CSS_SELECTOR, ".block__curriculum__section__title"
             ).text
-            chapter_title = clean_string(chapter_title)
-            chapter_title = f"{chapter_idx:02d}-{chapter_title}"
-            logger.info("Found chapter: " + chapter_title)
-
-            download_path = os.path.join(course_path, chapter_title)
-            os.makedirs(download_path, exist_ok=True)
-
-            chapter_idx += 1
-            idx = 1
-
-            section_items = section.find_elements(
-                By.CSS_SELECTOR, ".block__curriculum__section__list__item__link"
-            )
-            for item in section_items:
-                lecture_link = item.get_attribute("href")
-                lecture_title = item.find_element(
-                    By.CSS_SELECTOR,
-                    ".block__curriculum__section__list__item__lecture-name",
-                ).text
-                lecture_title = clean_string(lecture_title)
-                lecture_title = "".join(
-                    char for char in lecture_title if char in string.printable
+            lectures = [
+                (
+                    item.get_attribute("href"),
+                    item.find_element(
+                        By.CSS_SELECTOR,
+                        ".block__curriculum__section__list__item__lecture-name",
+                    ).text,
                 )
-                logger.info("Found lecture: " + lecture_title)
-
-                truncated_lecture_title = truncate_title_to_fit_filename(lecture_title)
-                video_entity = {
-                    "link": lecture_link,
-                    "title": truncated_lecture_title,
-                    "download_path": download_path,
-                    "idx": idx,
-                }
-                video_list.append(video_entity)
-                idx += 1
+                for item in section.find_elements(
+                    By.CSS_SELECTOR, ".block__curriculum__section__list__item__link"
+                )
+            ]
+            self.add_chapter(
+                video_list, course_path, chapter_idx, chapter_title, lectures
+            )
 
         self.download_videos_from_links(video_list)
 
     def download_course_classic(self, course_url):
         logger.info("Detected _mainbar course format")
-        course_title = self.get_course_title(
+        course_path = self.prepare_course(
             course_url,
             By.CSS_SELECTOR,
             "body > section > div.course-sidebar > div > h2",
         )
-        course_path = create_folder(course_title)
-
-        self.save_course_html(course_path)
         self.get_course_image(course_path, By.CLASS_NAME, "course-image")
 
-        chapter_idx = 1
         video_list = []
-        sections = WebDriverWait(self.driver, 10).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".course-section"))
-        )
-        for section in sections:
+        sections = self.wait_for_sections(".course-section")
+        for chapter_idx, section in enumerate(sections, start=1):
             chapter_title = section.find_element(By.CSS_SELECTOR, ".section-title").text
-            chapter_title = clean_string(chapter_title)
-            chapter_title = f"{chapter_idx:02d}-{chapter_title}"
-            logger.info("Found chapter: " + chapter_title)
-
-            download_path = os.path.join(course_path, chapter_title)
-            os.makedirs(download_path, exist_ok=True)
-
-            chapter_idx += 1
-            idx = 1
-
-            section_items = section.find_elements(By.CSS_SELECTOR, ".section-item")
-            for item in section_items:
-                lecture_link = item.find_element(By.CLASS_NAME, "item").get_attribute(
-                    "href"
+            lectures = [
+                (
+                    item.find_element(By.CLASS_NAME, "item").get_attribute("href"),
+                    item.find_element(By.CLASS_NAME, "lecture-name").text,
                 )
-                lecture_title = item.find_element(By.CLASS_NAME, "lecture-name").text
-                lecture_title = clean_string(lecture_title)
-                logger.info("Found lecture: " + lecture_title)
-
-                truncated_lecture_title = truncate_title_to_fit_filename(lecture_title)
-
-                video_entity = {
-                    "link": lecture_link,
-                    "title": truncated_lecture_title,
-                    "download_path": download_path,
-                    "idx": idx,
-                }
-                video_list.append(video_entity)
-                idx += 1
+                for item in section.find_elements(By.CSS_SELECTOR, ".section-item")
+            ]
+            self.add_chapter(
+                video_list, course_path, chapter_idx, chapter_title, lectures
+            )
 
         self.download_videos_from_links(video_list)
 
     def download_course_simple(self, course_url):
-        self.driver.implicitly_wait(2)
         logger.info("Detected next course format")
-        course_title = self.get_course_title_simple(course_url)
-        course_path = create_folder(course_title)
-
-        self.save_course_html(course_path)
+        course_path = self.prepare_course(course_url, By.CSS_SELECTOR, ".heading")
         self.get_course_image(
             course_path, By.XPATH, '//*[@id="__next"]/div/div/div[2]/div/div[1]/img'
         )
 
-        chapter_idx = 0
         video_list = []
-        slim_sections = self.driver.find_elements(By.CSS_SELECTOR, ".slim-section")
-        for section in slim_sections:
-            chapter_idx += 1
-            bars = section.find_elements(By.CSS_SELECTOR, ".bar")
+        sections = self.wait_for_sections(".slim-section")
+        for chapter_idx, section in enumerate(sections, start=1):
             chapter_title = section.find_element(By.CSS_SELECTOR, ".heading").text
-            chapter_title = clean_string(chapter_title)
-            chapter_title = f"{chapter_idx:02d}-{chapter_title}"
-            logger.info("Found chapter: " + chapter_title)
-
-            try:
-                WebDriverWait(section, self.global_timeout).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".drip-tag"))
-                )
-                logger.warning('Chapter "%s" not available, skipping', chapter_title)
+            # A drip tag means the chapter isn't released yet
+            if section.find_elements(By.CSS_SELECTOR, ".drip-tag"):
+                logger.warning(f'Chapter "{chapter_title}" not available, skipping')
                 continue
-            except TimeoutException:
-                logger.info("Chapter is available")
-                # Element wasn't found so the chapter is available
 
-            download_path = os.path.join(course_path, chapter_title)
-            os.makedirs(download_path, exist_ok=True)
-
-            idx = 1
-            for bar in bars:
+            lectures = []
+            for bar in section.find_elements(By.CSS_SELECTOR, ".bar"):
                 video = bar.find_element(By.CSS_SELECTOR, ".text")
-                link = video.get_attribute("href")
-                # Remove new line characters from the title and replace spaces with -
-                title = clean_string(video.text)
-                logger.info("Found lecture: " + title)
-                truncated_title = truncate_title_to_fit_filename(title)
-                video_entity = {
-                    "link": link,
-                    "title": truncated_title,
-                    "download_path": download_path,
-                    "idx": idx,
-                }
-                video_list.append(video_entity)
-                idx += 1
+                lectures.append((video.get_attribute("href"), video.text))
+            self.add_chapter(
+                video_list, course_path, chapter_idx, chapter_title, lectures
+            )
 
         self.download_videos_from_links(video_list)
 
@@ -655,174 +700,41 @@ class TeachableDownloader:
             self.driver.get(course_url)
         try:
             logger.info("Getting course title")
-            course_title = (
-                WebDriverWait(self.driver, self.global_timeout)
-                .until(EC.presence_of_element_located((by, selector)))
-                .text
-            )
+            course_title = self.wait_for(by, selector).text
         except Exception:
             logger.warning("Could not get course title, using tab title instead")
             course_title = self.driver.title
         return clean_string(course_title)
 
-    def get_course_title_simple(self, course_url):
-        if self.driver.current_url != course_url:
-            self.driver.get(course_url)
-        WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".wrap"))
-        )
-        heading = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".heading"))
-        )
-        course_title = heading.text
-        return clean_string(course_title)
-
-    def save_course_image(self, course_path, image_src):
-        image_path = os.path.join(course_path, "course-image.jpg")
-
-        # Skip existing image if it already exists
-        if os.path.exists(image_path):
-            logger.info("Image already exists, skipping download.")
-            return True
-
-        try:
-            response = requests.get(image_src, timeout=30)
-        except requests.RequestException as e:
-            logger.warning("Could not download course image: " + str(e))
-            return False
-
-        if not response.ok:
-            logger.warning(
-                f"Failed to download image (HTTP {response.status_code}): {image_src}"
-            )
-            return False
-
-        # Write to a temporary file first so an interrupted write never leaves a
-        # partial image at image_path, which the existence check would skip
-        part_path = image_path + ".part"
-        with open(part_path, "wb") as f:
-            f.write(response.content)
-        os.replace(part_path, image_path)
-
-        logger.info("Image downloaded successfully.")
-        return True
-
     def get_course_image(self, course_path, by, selector):
-        image_element = self.driver.find_elements(by, selector)
-
-        if not image_element:
+        image_elements = self.driver.find_elements(by, selector)
+        if not image_elements:
             logger.warning("No course image element found")
             return
 
-        try:
-            logger.info("Found course image")
-            image_src = image_element[0].get_attribute("src")
-            # Try the high-definition version first, falling back to the
-            # original link if that fails for any reason.
-            image_src_hd = re.sub(r"/resize=.+?/", "/", image_src)
-            if self.save_course_image(course_path, image_src_hd):
-                return
-            self.save_course_image(course_path, image_src)
-        except Exception as e:
-            logger.warning("Could not find course image: " + str(e))
+        logger.info("Found course image")
+        image_path = os.path.join(course_path, "course-image.jpg")
+        image_src = image_elements[0].get_attribute("src")
+        # Try the high-definition version first, falling back to the original link
+        image_src_hd = re.sub(r"/resize=.+?/", "/", image_src)
+        if not self.download_file(image_src_hd, image_path, "course image"):
+            self.download_file(image_src, image_path, "course image")
 
-    def save_course_html(self, course_path):
-        try:
-            logger.debug("Saving course html")
-            output_file = os.path.join(course_path, "course.html")
-            with open(output_file, "w+", encoding="utf-8") as f:
-                f.write(self.driver.page_source)
-        except Exception as e:
-            logger.error("Could not save course html: " + str(e), exc_info=self.verbose)
-
-    def find_video_widgets(self):
-        # Most templates wrap each video in a widget that mounts its player iframe later via JS;
-        # for templates without those widgets, fall back to the player iframes on the page
-        widgets = self.driver.find_elements(
-            By.CLASS_NAME, "lecture-attachment-type-video"
-        )
-        if widgets:
-            return widgets
-        return self.driver.find_elements(
-            By.XPATH, "//iframe[starts-with(@data-testid, 'embed-player')]"
-        )
-
-    def download_video_widget(
-        self, widget, widget_index, total_widgets, title, idx, download_path
-    ):
-        # Later widgets can take much longer to mount their iframe, so wait well past
-        # global_timeout. Scroll once, then poll: re-scrolling can reset the lazy-loader's
-        # visibility timer and stop the widget from mounting at all.
-        self.driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'});", widget
-        )
-
-        iframe = None
-        max_wait_seconds = max(self.global_timeout * 3, 30)
-        deadline = time.time() + max_wait_seconds
-        attempt_num = 0
-
-        while time.time() < deadline:
-            attempt_num += 1
-            # descendant-or-self: a widget may be the iframe itself (see find_video_widgets)
-            frames = widget.find_elements(
-                By.XPATH,
-                "descendant-or-self::iframe[starts-with(@data-testid, 'embed-player')]",
-            )
-            if frames:
-                iframe = frames[0]
-                break
-            if attempt_num % 4 == 0:
-                logger.debug(
-                    f"Still waiting for video {widget_index + 1}/{total_widgets} to mount its player ({title})"
-                )
-            time.sleep(1)  # Wait a bit before retrying
-
-        if iframe is None:
-            raise TimeoutException(
-                f"video {widget_index + 1}/{total_widgets} never mounted its player within {max_wait_seconds}s"
-            )
-
-        logger.info("Switching to video frame")
-        self.driver.switch_to.frame(iframe)
-
-        # Lazy-loaded iframes may not have rendered the video data
-        # yet, so wait for it rather than failing immediately.
-        script_text = WebDriverWait(self.driver, self.global_timeout).until(
-            EC.presence_of_element_located((By.ID, "__NEXT_DATA__"))
-        )
-        json_text = json.loads(script_text.get_attribute("innerHTML"))
-        link = json_text["props"]["pageProps"]["applicationData"]["mediaAssets"][0][
-            "urlEncrypted"
-        ]
-
-        # Append -n to the video title if there are multiple widgets
-        video_title = title + ("-" + str(widget_index + 1) if total_widgets > 1 else "")
-
-        try:
-            logger.info("Downloading subtitle")
-            self.download_subtitle(link, video_title, idx, download_path)
-        except Exception as e:
-            logger.warning(
-                "Could not download subtitle: " + video_title + " cause: " + str(e)
-            )
-
-        logger.info("Downloading video")
-        return self.download_video(link, video_title, idx, download_path)
+    # --- Lectures ---
 
     def is_lecture_already_saved(self, video):
         title = video["title"]
-        video_index = video["idx"]
         output_path = video["download_path"]
+        name = lecture_name(video["idx"], title)
 
-        html_path = os.path.join(output_path, f"{video_index:02d}-{title}.html")
+        html_path = os.path.join(output_path, f"{name}.html")
         if not os.path.exists(html_path):
             return False
         try:
             with open(html_path, "r", encoding="utf-8") as f:
                 content = f.read()
         except Exception as e:
-            logger.debug(f"Could not read saved lecture html: {html_path} cause: {e!s}")
+            logger.debug(f"Could not read saved lecture html: {html_path} cause: {e}")
             return False
         if "content locked" in content.lower():
             return False
@@ -838,26 +750,23 @@ class TeachableDownloader:
             )
             return False
 
-        video_title = f"{video_index:02d}-{title}"
+        def missing(label, filename):
+            logger.debug(f"{title}: missing expected {label} {filename}, will re-check")
+            return False
 
-        # Videos: one file per video widget, "-n" suffixed when there's more
-        # than one (matching download_videos_from_links' own naming).
-        video_widget_count = len(re.findall(r"lecture-attachment-type-video", content))
-        for i in range(1, video_widget_count + 1):
-            suffix = f"-{i}" if video_widget_count > 1 else ""
-            expected_title = f"{video_title}{suffix}"
-            # Video extensions only: ".*" would also match this lecture's own .html snapshot
-            has_video_file = any(
-                os.path.isfile(os.path.join(output_path, f"{expected_title}.{ext}"))
-                for ext in VIDEO_EXTENSIONS
+        # Videos: one per video widget (or player iframe, see find_video_widgets), named
+        # the same way download_video_widgets does
+        video_count = len(re.findall(r"lecture-attachment-type-video", content)) or len(
+            re.findall(r'data-testid="embed-player', content)
+        )
+        for i in range(video_count):
+            expected = lecture_name(
+                video["idx"], widget_video_title(title, i, video_count)
             )
-            if not has_video_file:
-                logger.debug(
-                    f"{title}: missing expected video {expected_title}, will re-check"
-                )
-                return False
+            if not find_existing_video(output_path, expected):
+                return missing("video", expected)
 
-        attachment_output_path = os.path.join(output_path, video_title)
+        attachment_path = os.path.join(output_path, name)
 
         # File-type attachments (downloaded via wget). A lecture can have
         # more than one separate file-attachment block.
@@ -869,12 +778,9 @@ class TeachableDownloader:
             for href in re.findall(r'href="([^"]+)"', file_block.group(1)):
                 filename = os.path.basename(urlparse(href).path)
                 if filename and not os.path.isfile(
-                    os.path.join(attachment_output_path, filename)
+                    os.path.join(attachment_path, filename)
                 ):
-                    logger.debug(
-                        f"{title}: missing expected attachment {filename}, will re-check"
-                    )
-                    return False
+                    return missing("attachment", filename)
 
         # Audio attachments (the mp3 player widget)
         for audio_match in re.finditer(
@@ -885,16 +791,11 @@ class TeachableDownloader:
             if not href_match:
                 continue
             name_match = re.search(r'audioloader__name["\'][^>]*>([^<]*)<', block)
-            audio_filename = name_match.group(1).strip() if name_match else ""
-            if not audio_filename:
-                audio_filename = os.path.basename(urlparse(href_match.group(1)).path)
-            if audio_filename and not os.path.isfile(
-                os.path.join(attachment_output_path, audio_filename)
-            ):
-                logger.debug(
-                    f"{title}: missing expected audio attachment {audio_filename}, will re-check"
-                )
-                return False
+            filename = audio_attachment_filename(
+                name_match and name_match.group(1), href_match.group(1)
+            )
+            if filename and not os.path.isfile(os.path.join(attachment_path, filename)):
+                return missing("audio attachment", filename)
 
         # PDF-embed attachments
         for pdf_block in re.finditer(
@@ -906,14 +807,11 @@ class TeachableDownloader:
                 r'data-x-origin-download-name="([^"]+)"', pdf_block.group(1)
             )
             if name_match and not os.path.isfile(
-                os.path.join(attachment_output_path, name_match.group(1))
+                os.path.join(attachment_path, name_match.group(1))
             ):
-                logger.debug(
-                    f"{title}: missing expected PDF {name_match.group(1)}, will re-check"
-                )
-                return False
+                return missing("PDF", name_match.group(1))
 
-        # Inline content images. Number them like download_attachments does (one counter
+        # Inline content images. Number them like download_content_images does (one counter
         # from 1, in page order) so the "image-{idx}.{ext}" fallback names match.
         image_idx = 0
         for text_block in re.finditer(
@@ -923,184 +821,168 @@ class TeachableDownloader:
                 image_idx += 1
                 loader_src_match = re.search(r'data-imageloader-src="([^"]+)"', img)
                 src_match = re.search(r'\bsrc="([^"]+)"', img)
-                loader_src = loader_src_match.group(1) if loader_src_match else ""
-                src = src_match.group(1) if src_match else ""
-
-                image_link = next(
-                    (c for c in (loader_src, src) if c and not c.startswith("data:")),
-                    None,
+                filename, _, _ = image_download_target(
+                    image_idx,
+                    loader_src_match.group(1) if loader_src_match else "",
+                    src_match.group(1) if src_match else "",
                 )
-                if image_link:
-                    image_filename = os.path.basename(
-                        urlparse(unquote(image_link)).path
-                    )
-                    if not image_filename:
-                        image_filename = f"image-{image_idx}.png"
-                    if not os.path.isfile(
-                        os.path.join(attachment_output_path, image_filename)
-                    ):
-                        logger.debug(
-                            f"{title}: missing expected image {image_filename}, will re-check"
-                        )
-                        return False
-                    continue
-
-                # No real URL, but a full base64 image is decoded and saved under this fallback name.
-                data_uri = loader_src if loader_src.startswith("data:") else src
-                match = (
-                    re.match(r"data:image/([a-zA-Z0-9.+-]+);base64,", data_uri)
-                    if data_uri
-                    else None
-                )
-                if not match:
-                    continue
-                ext = match.group(1).replace("jpeg", "jpg")
-                image_filename = f"image-{image_idx}.{ext}"
-                if not os.path.isfile(
-                    os.path.join(attachment_output_path, image_filename)
+                if filename and not os.path.isfile(
+                    os.path.join(attachment_path, filename)
                 ):
-                    logger.debug(
-                        f"{title}: missing expected inline image {image_filename}, will re-check"
-                    )
-                    return False
+                    return missing("image", filename)
 
         return True
 
-    def is_dead_session_error(self, e):
-        return (
-            isinstance(e, InvalidSessionIdException)
-            or "invalid session id" in str(e).lower()
-        )
+    def open_lecture(self, link, title):
+        self.driver.get(link)
+        # Wait for the lecture content the steps below look for (attachments or a video player)
+        try:
+            self.wait_for(By.CSS_SELECTOR, LECTURE_CONTENT_SELECTOR)
+        except TimeoutException:
+            logger.warning(f"No attachments or video found for lecture: {title}")
 
     def download_videos_from_links(self, video_list):
         for video in video_list:
-            if self.is_lecture_already_saved(video):
-                logger.info("Skipping already saved lecture: " + video["title"])
-                continue
-
             link = video["link"]
             title = video["title"]
             download_path = video["download_path"]
             idx = video["idx"]
 
+            if self.is_lecture_already_saved(video):
+                logger.info(f"Skipping already saved lecture: {title}")
+                continue
+
             # Created lazily, right before it's actually needed
             os.makedirs(download_path, exist_ok=True)
 
             if self.driver.current_url != link:
-                logger.info("Navigating to lecture: " + title)
-                self.driver.get(link)
-
-                # Wait for the lecture content the steps below look for
-                # attachments or a video player to render
-                try:
-                    WebDriverWait(self.driver, self.global_timeout).until(
-                        EC.presence_of_element_located(
-                            (By.CSS_SELECTOR, LECTURE_CONTENT_SELECTOR)
-                        )
-                    )
-                except TimeoutException:
-                    logger.warning(
-                        "No attachments or video found for lecture: " + title
-                    )
-
+                logger.info(f"Navigating to lecture: {title}")
+                self.open_lecture(link, title)
                 self.scroll_page_to_trigger_lazy_content()
 
-            logger.info("Downloading lecture: " + title)
-            try:
-                logger.info("Saving html")
-                self.save_webpage_as_html(title, idx, download_path)
-            except Exception as e:
-                if self.is_dead_session_error(e):
-                    raise
-                logger.error(
-                    "Could not save html: " + title + " cause: " + str(e),
-                    exc_info=self.verbose,
-                )
+            logger.info(f"Downloading lecture: {title}")
+            self.try_step(
+                f"save html for {title}",
+                self.save_page_html,
+                os.path.join(download_path, f"{lecture_name(idx, title)}.html"),
+                level=logging.ERROR,
+            )
+            self.try_step(
+                f"download attachments for {title}",
+                self.download_attachments,
+                title,
+                idx,
+                download_path,
+            )
 
-            try:
-                logger.info("Downloading attachments")
-                self.download_attachments(link, title, idx, download_path)
-            except Exception as e:
-                if self.is_dead_session_error(e):
-                    raise
-                logger.warning(
-                    "Could not download attachments: " + title + " cause: " + str(e)
-                )
-
-            try:
-                logger.debug("Trying to download video as an attachment")
-                if self.download_video_file(title, idx, download_path):
-                    continue
-            except Exception as e:
-                if self.is_dead_session_error(e):
-                    raise
-                logger.debug(
-                    "Could not download video as an attachment: "
-                    + title
-                    + " cause: "
-                    + str(e)
-                )
-
-            # Iterate the widgets and wait for each one's iframe individually as each video widget
-            # mounts its embed-player iframe asynchronously via JS after the page loads
-            video_widgets = self.find_video_widgets()
-
-            total_widgets = len(video_widgets)
-            for i, widget in enumerate(video_widgets):
-                current_widget = widget
-                # Signed video links are created when the page loads and expire after a while.
-                # On lectures with many videos, later links can expire (403) before we reach
-                # them, so reload the page for fresh links and retry once.
-                for attempt_num in range(2):
-                    try:
-                        if attempt_num > 0:
-                            logger.info(
-                                f"Video {i + 1}/{total_widgets} failed, likely an expired link — reloading the page and retrying once"
-                            )
-                            self.driver.get(link)
-                            WebDriverWait(self.driver, self.global_timeout).until(
-                                EC.presence_of_element_located(
-                                    (By.CSS_SELECTOR, LECTURE_CONTENT_SELECTOR)
-                                )
-                            )
-                            refreshed_widgets = self.find_video_widgets()
-                            if i >= len(refreshed_widgets):
-                                logger.warning(
-                                    f"Widget {i + 1}/{total_widgets} no longer found after reload; giving up on it"
-                                )
-                                break
-                            current_widget = refreshed_widgets[i]
-
-                        if self.download_video_widget(
-                            current_widget, i, total_widgets, title, idx, download_path
-                        ):
-                            break
-                    except Exception as e:
-                        if self.is_dead_session_error(e):
-                            raise
-                        logger.warning(
-                            "Could not find video: " + title + " cause: " + str(e)
-                        )
-                    finally:
-                        # Reset top-level context so the next widget (or next lecture)
-                        # doesn't inherit a broken frame context
-                        self.driver.switch_to.default_content()
-
-            logger.info("Downloaded video: " + title)
+            # Some lectures offer the video as a downloadable file; otherwise use the player
+            if not self.try_step(
+                f"download video file for {title}",
+                self.download_video_file,
+                title,
+                idx,
+                download_path,
+                level=logging.DEBUG,
+            ):
+                self.download_video_widgets(link, title, idx, download_path)
 
             if self._complete_lecture:
+                self.try_step(f"complete lecture {title}", self.complete_lecture)
+
+            logger.info(f"Finished lecture: {title}")
+
+    def find_video_widgets(self):
+        # Most templates wrap each video in a widget that mounts its player iframe later via JS;
+        # for templates without those widgets, fall back to the player iframes on the page
+        widgets = self.driver.find_elements(
+            By.CLASS_NAME, "lecture-attachment-type-video"
+        )
+        return widgets or self.driver.find_elements(By.XPATH, f"//{EMBED_PLAYER_XPATH}")
+
+    def download_video_widgets(self, link, title, idx, download_path):
+        # Iterate the widgets and wait for each one's iframe individually as each video widget
+        # mounts its embed-player iframe asynchronously via JS after the page loads
+        video_widgets = self.find_video_widgets()
+        total_widgets = len(video_widgets)
+        for i, widget in enumerate(video_widgets):
+            current_widget = widget
+            # Signed video links are created when the page loads and expire after a while.
+            # On lectures with many videos, later links can expire (403) before we reach
+            # them, so reload the page for fresh links and retry once.
+            for attempt_num in range(2):
                 try:
-                    logger.info("Completing lecture")
-                    self.complete_lecture()
+                    if attempt_num > 0:
+                        logger.info(
+                            f"Video {i + 1}/{total_widgets} failed, likely an expired link — reloading the page and retrying once"
+                        )
+                        self.open_lecture(link, title)
+                        refreshed_widgets = self.find_video_widgets()
+                        if i >= len(refreshed_widgets):
+                            logger.warning(
+                                f"Widget {i + 1}/{total_widgets} no longer found after reload; giving up on it"
+                            )
+                            break
+                        current_widget = refreshed_widgets[i]
+
+                    if self.download_video_widget(
+                        current_widget, i, total_widgets, title, idx, download_path
+                    ):
+                        break
                 except Exception as e:
                     if self.is_dead_session_error(e):
                         raise
-                    logger.warning(
-                        "Could not complete lecture: "
-                        + video["title"]
-                        + " cause: "
-                        + str(e)
-                    )
+                    logger.warning(f"Could not find video: {title} cause: {e}")
+                finally:
+                    # Reset top-level context so the next widget (or next lecture)
+                    # doesn't inherit a broken frame context
+                    self.driver.switch_to.default_content()
+
+    def download_video_widget(
+        self, widget, widget_index, total_widgets, title, idx, download_path
+    ):
+        # Later widgets can take much longer to mount their iframe, so wait well past
+        # global_timeout. Scroll once, then poll: re-scrolling can reset the lazy-loader's
+        # visibility timer and stop the widget from mounting at all.
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", widget
+        )
+
+        max_wait_seconds = max(self.global_timeout * 3, 30)
+        try:
+            # descendant-or-self: a widget may be the iframe itself (see find_video_widgets)
+            frames = WebDriverWait(
+                self.driver, max_wait_seconds, poll_frequency=1
+            ).until(
+                lambda _: widget.find_elements(
+                    By.XPATH, f"descendant-or-self::{EMBED_PLAYER_XPATH}"
+                )
+            )
+        except TimeoutException:
+            raise TimeoutException(
+                f"video {widget_index + 1}/{total_widgets} never mounted its player within {max_wait_seconds}s"
+            ) from None
+
+        logger.info("Switching to video frame")
+        self.driver.switch_to.frame(frames[0])
+
+        # Lazy-loaded iframes may not have rendered the video data
+        # yet, so wait for it rather than failing immediately.
+        script_text = self.wait_for(By.ID, "__NEXT_DATA__")
+        json_text = json.loads(script_text.get_attribute("innerHTML"))
+        link = json_text["props"]["pageProps"]["applicationData"]["mediaAssets"][0][
+            "urlEncrypted"
+        ]
+
+        video_title = widget_video_title(title, widget_index, total_widgets)
+        self.try_step(
+            f"download subtitle for {video_title}",
+            self.download_subtitle,
+            link,
+            video_title,
+            idx,
+            download_path,
+        )
+        return self.download_video(link, video_title, idx, download_path)
 
     def scroll_page_to_trigger_lazy_content(self):
         try:
@@ -1117,480 +999,286 @@ class TeachableDownloader:
                 )
             self.driver.execute_script("window.scrollTo(0, 0);")
         except Exception as e:
-            logger.debug("Could not scroll page to trigger lazy content: " + str(e))
+            logger.debug(f"Could not scroll page to trigger lazy content: {e}")
 
-    def save_webpage_as_html(self, title, video_index, output_path):
-        output_file = os.path.join(output_path, f"{video_index:02d}-{title}.html")
-        with open(output_file, "w+", encoding="utf-8") as f:
-            f.write(self.driver.page_source)
-        logger.info("Saved webpage as html: " + output_file)
+    # --- Attachments ---
 
-    def download_attachments(self, link, title, video_index, output_path):
-        video_title = f"{video_index:02d}-{title}"
-        output_path = os.path.join(output_path, video_title)
+    def download_attachments(self, title, video_index, output_path):
+        output_path = os.path.join(output_path, lecture_name(video_index, title))
+        for action, func in (
+            ("download file attachments", self.download_file_attachments),
+            ("download PDF attachments", self.download_pdf_attachments),
+            ("download audio attachments", self.download_audio_attachments),
+            ("download content images", self.download_content_images),
+        ):
+            self.try_step(f"{action} for {title}", func, output_path, title)
 
-        # Grab the video attachments type file
-        video_attachments = self.driver.find_elements(
-            By.CLASS_NAME, "lecture-attachment-type-file"
+    def download_file_attachments(self, output_path, title):
+        # A lecture can have more than one separate file-attachment block
+        links = self.driver.find_elements(
+            By.CSS_SELECTOR, ".lecture-attachment-type-file a"
         )
-        if video_attachments:
-            # Get all links from the video attachments
-            # A lecture can have more than one separate file-attachment block
-            video_links = [
-                a
-                for block in video_attachments
-                for a in block.find_elements(By.TAG_NAME, "a")
-            ]
+        if not links:
+            logger.debug(f"No file attachments found for video: {title}")
+            return
 
-            # Get href attribute from the first link
-            if video_links:
-                for video_link in video_links:
-                    link = video_link.get_attribute("href")
-                    filename = video_link.text
-                    # wget names the file after the URL, not the link text, so
-                    # check against that to detect an already-downloaded file.
-                    url_filename = os.path.basename(urlparse(link).path)
-                    if url_filename and os.path.isfile(
-                        os.path.join(output_path, url_filename)
-                    ):
-                        logger.info("Skipping existing attachment: " + url_filename)
-                        continue
-                    logger.info(
-                        "Downloading attachment: " + filename + " for video: " + title
-                    )
-                    # Download file and save the file in output_path directory;
-                    # wget treats out as a file name unless the folder already exists
-                    os.makedirs(output_path, exist_ok=True)
-                    wget.download(link, out=output_path)
-        else:
-            logger.info("No attachments found for video: " + title)
+        for link in links:
+            href = link.get_attribute("href")
+            # wget names the file after the URL, not the link text, so
+            # check against that to detect an already-downloaded file.
+            url_filename = os.path.basename(urlparse(href).path)
+            if url_filename and skip_existing(
+                os.path.join(output_path, url_filename), "attachment"
+            ):
+                continue
+            logger.info(f"Downloading attachment: {link.text} for video: {title}")
+            # wget treats out as a file name unless the folder already exists
+            os.makedirs(output_path, exist_ok=True)
+            wget.download(href, out=output_path)
 
-        # Grab the video attachments type pdf_embed
-        pdf_attachments = self.driver.find_elements(
+    def download_pdf_attachments(self, output_path, title):
+        blocks = self.driver.find_elements(
             By.CLASS_NAME, "lecture-attachment-type-pdf_embed"
         )
-        if pdf_attachments:
-            for attachment in pdf_attachments:
-                pdf_link = attachment.find_element(By.TAG_NAME, "a")
-                pdf_filename = pdf_link.get_attribute("data-x-origin-download-name")
-                if pdf_filename and os.path.isfile(
-                    os.path.join(output_path, pdf_filename)
-                ):
-                    logger.info("Skipping existing PDF attachment: " + pdf_filename)
-                    continue
-                logger.info(
-                    "Downloading PDF attachment: "
-                    + pdf_filename
-                    + " for video: "
-                    + title
-                )
-                # Use the webdriver to download the PDF
-                os.makedirs(output_path, exist_ok=True)
-                self.webdriver_download(output_path, pdf_link.click, pdf_filename)
-        else:
-            logger.info("No PDF attachments found for video: " + title)
+        if not blocks:
+            logger.debug(f"No PDF attachments found for video: {title}")
+            return
 
-        # Grab audio attachments (the mp3 player widget), whose actual file
-        # URL sits in the button's data-href rather than an <a href>.
-        audio_widgets = self.driver.find_elements(
-            By.CLASS_NAME, "audioloader__placeholder"
-        )
-        if audio_widgets:
-            os.makedirs(output_path, exist_ok=True)
-            for audio_widget in audio_widgets:
-                try:
-                    audio_button = audio_widget.find_element(By.TAG_NAME, "button")
-                    audio_link = audio_button.get_attribute("data-href")
-                    if not audio_link:
-                        continue
-                    try:
-                        audio_filename = audio_widget.find_element(
-                            By.CLASS_NAME, "audioloader__name"
-                        ).text.strip()
-                    except Exception:
-                        audio_filename = ""
-                    if not audio_filename:
-                        audio_filename = os.path.basename(urlparse(audio_link).path)
-                    if audio_filename and os.path.isfile(
-                        os.path.join(output_path, audio_filename)
-                    ):
-                        logger.info("Skipping existing audio file: " + audio_filename)
-                        continue
-                    logger.info("Downloading audio attachment: " + audio_filename)
-                    response = requests.get(
-                        audio_link, headers=self.headers, timeout=30
-                    )
-                    if response.ok:
-                        with open(os.path.join(output_path, audio_filename), "wb") as f:
-                            f.write(response.content)
-                    else:
-                        logger.warning(
-                            "Failed to download audio attachment: " + audio_filename
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "Could not download audio attachment for video: "
-                        + title
-                        + " cause: "
-                        + str(e)
-                    )
-        else:
-            logger.info("No audio attachments found for video: " + title)
-
-        # Grab images embedded directly in the lecture's rich-text content
-        logger.debug("Scanning for content images")
-        image_elements = []
-        try:
-            text_containers = self.driver.find_elements(
-                By.CLASS_NAME, "lecture-text-container"
+        for block in blocks:
+            pdf_links = block.find_elements(By.TAG_NAME, "a")
+            if not pdf_links:
+                continue
+            pdf_filename = pdf_links[0].get_attribute("data-x-origin-download-name")
+            if pdf_filename and skip_existing(
+                os.path.join(output_path, pdf_filename), "PDF attachment"
+            ):
+                continue
+            logger.info(
+                f"Downloading PDF attachment: {pdf_filename} for video: {title}"
             )
-            for text_container in text_containers:
-                try:
-                    image_elements.extend(
-                        text_container.find_elements(By.TAG_NAME, "img")
-                    )
-                except Exception as e:
-                    logger.debug(
-                        "Could not read one lecture-text-container's images: " + str(e)
-                    )
-        except Exception as e:
-            logger.warning("Could not scan for content images: " + str(e))
+            # Use the webdriver to download the PDF
+            if not self.webdriver_download(
+                output_path, pdf_links[0].click, pdf_filename
+            ):
+                logger.warning(f"Could not download PDF attachment: {pdf_filename}")
+
+    def download_audio_attachments(self, output_path, title):
+        # The mp3 player widget's file URL sits in the button's data-href, not an <a href>
+        widgets = self.driver.find_elements(By.CLASS_NAME, "audioloader__placeholder")
+        if not widgets:
+            logger.debug(f"No audio attachments found for video: {title}")
+            return
+
+        for widget in widgets:
+            self.try_step(
+                f"download audio attachment for {title}",
+                self.download_audio_attachment,
+                widget,
+                output_path,
+            )
+
+    def download_audio_attachment(self, widget, output_path):
+        buttons = widget.find_elements(By.TAG_NAME, "button")
+        audio_link = buttons[0].get_attribute("data-href") if buttons else None
+        if not audio_link:
+            return
+        names = widget.find_elements(By.CLASS_NAME, "audioloader__name")
+        filename = audio_attachment_filename(names[0].text if names else "", audio_link)
+        self.download_file(
+            audio_link,
+            os.path.join(output_path, filename),
+            "audio attachment",
+            headers=self.headers,
+        )
+
+    def download_content_images(self, output_path, title):
+        # Images embedded directly in the lecture's rich-text content
+        image_elements = self.driver.find_elements(
+            By.CSS_SELECTOR, ".lecture-text-container img"
+        )
+        if not image_elements:
+            logger.debug(f"No content images found for video: {title}")
+            return
+
         logger.debug(f"Found {len(image_elements)} content image(s)")
+        for idx, image_element in enumerate(image_elements, start=1):
+            self.try_step(
+                f"download image {idx} for {title}",
+                self.download_content_image,
+                image_element,
+                idx,
+                output_path,
+            )
 
-        if image_elements:
-            for idx, image_element in enumerate(image_elements, start=1):
-                try:
-                    loader_src = (
-                        image_element.get_attribute("data-imageloader-src") or ""
-                    )
-                    src = image_element.get_attribute("src") or ""
-                except Exception as e:
-                    logger.debug(f"Could not read image {idx} src: " + str(e))
-                    continue
+    def download_content_image(self, image_element, idx, output_path):
+        def image_srcs():
+            return (
+                image_element.get_attribute("data-imageloader-src") or "",
+                image_element.get_attribute("src") or "",
+            )
 
-                # Scrolling the whole page once doesn't load every lazy image, so scroll each
-                # image that still has a base64 placeholder into view and wait for its real URL.
-                if (not loader_src or loader_src.startswith("data:")) and (
-                    not src or src.startswith("data:")
-                ):
-                    try:
-                        self.driver.execute_script(
-                            "arguments[0].scrollIntoView({block: 'center'});",
-                            image_element,
-                        )
-                        deadline = time.time() + 8
-                        while time.time() < deadline:
-                            time.sleep(0.5)
-                            loader_src = (
-                                image_element.get_attribute("data-imageloader-src")
-                                or ""
-                            )
-                            src = image_element.get_attribute("src") or ""
-                            if (loader_src and not loader_src.startswith("data:")) or (
-                                src and not src.startswith("data:")
-                            ):
-                                logger.debug(
-                                    f"Image {idx} resolved to a real URL after a dedicated wait"
-                                )
-                                break
-                    except Exception as e:
-                        logger.debug(
-                            f"Could not re-check image {idx} after scrolling into view: "
-                            + str(e)
-                        )
+        def resolved_srcs(_):
+            srcs = image_srcs()
+            return srcs if not all(is_placeholder(s) for s in srcs) else False
 
-                image_link = next(
-                    (c for c in (loader_src, src) if c and not c.startswith("data:")),
-                    None,
+        loader_src, src = image_srcs()
+        # Scrolling the whole page once doesn't load every lazy image, so scroll each
+        # image that still has a base64 placeholder into view and wait for its real URL.
+        if is_placeholder(loader_src) and is_placeholder(src):
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", image_element
+            )
+            try:
+                loader_src, src = WebDriverWait(
+                    self.driver, 8, poll_frequency=0.5
+                ).until(resolved_srcs)
+                logger.debug(
+                    f"Image {idx} resolved to a real URL after a dedicated wait"
                 )
-                if image_link:
-                    image_filename = os.path.basename(
-                        urlparse(unquote(image_link)).path
-                    )
-                    if not image_filename:
-                        image_filename = f"image-{idx}.png"
-                    if os.path.isfile(os.path.join(output_path, image_filename)):
-                        logger.info("Skipping existing image: " + image_filename)
-                        continue
-                    logger.info(
-                        "Downloading image: " + image_filename + " for video: " + title
-                    )
-                    try:
-                        response = requests.get(
-                            image_link, headers=self.headers, timeout=30
-                        )
-                        if response.ok:
-                            # Create the folder only before the first write, so lectures whose
-                            # images never load don't leave an empty folder.
-                            os.makedirs(output_path, exist_ok=True)
-                            with open(
-                                os.path.join(output_path, image_filename), "wb"
-                            ) as f:
-                                f.write(response.content)
-                        else:
-                            logger.warning(
-                                "Failed to download image: " + image_filename
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            "Could not download image: "
-                            + image_filename
-                            + " cause: "
-                            + str(e)
-                        )
-                    continue
+            except TimeoutException:
+                pass
 
-                # No real URL appeared, but Teachable sometimes inlines the full image as a
-                # data: URI (not just a blurred preview), so decode and save that instead.
-                data_uri = loader_src if loader_src.startswith("data:") else src
-                match = (
-                    re.match(
-                        r"data:image/([a-zA-Z0-9.+-]+);base64,(.+)", data_uri, re.DOTALL
-                    )
-                    if data_uri
-                    else None
-                )
-                if not match:
-                    if data_uri:
-                        logger.debug(
-                            f"Skipping image {idx}: unrecognized data URI format"
-                        )
-                    continue
-                ext = match.group(1).replace("jpeg", "jpg")
-                image_filename = f"image-{idx}.{ext}"
-                if os.path.isfile(os.path.join(output_path, image_filename)):
-                    logger.info("Skipping existing image: " + image_filename)
-                    continue
-                try:
-                    image_bytes = base64.b64decode(match.group(2))
-                except Exception as e:
-                    logger.warning(f"Could not decode inline image {idx}: {e!s}")
-                    continue
-                logger.info(
-                    f"Saving inline (base64) image: {image_filename} for video: {title}"
-                )
-                os.makedirs(output_path, exist_ok=True)
-                with open(os.path.join(output_path, image_filename), "wb") as f:
-                    f.write(image_bytes)
-        else:
-            logger.info(f"No content images found for video: {title}")
+        filename, image_link, base64_data = image_download_target(idx, loader_src, src)
+        if not filename:
+            logger.debug(f"Skipping image {idx}: no usable source")
+            return
+
+        path = os.path.join(output_path, filename)
+        if image_link:
+            self.download_file(image_link, path, "image", headers=self.headers)
+            return
+
+        if skip_existing(path, "image"):
+            return
+        logger.info(f"Saving inline (base64) image: {filename}")
+        write_file(path, base64.b64decode(base64_data))
+
+    # --- Videos and subtitles ---
 
     def download_video_file(self, title, video_index, output_path, timeout=60):
-        video_title = f"{video_index:02d}-{title}"
-
-        # The extension isn't known until download, so match on the title with video extensions
-        existing_video_files = [
-            f
-            for ext in VIDEO_EXTENSIONS
-            for f in glob.glob(
-                os.path.join(
-                    glob.escape(output_path), glob.escape(video_title) + "." + ext
-                )
-            )
-        ]
-        if existing_video_files:
-            logger.info("Skipping existing video file: " + video_title)
+        name = lecture_name(video_index, title)
+        if find_existing_video(output_path, name):
+            logger.info(f"Skipping existing video file: {name}")
             return True
 
-        # Grab the video attachments type video
-        video_attachment = self.driver.find_element(
-            By.CLASS_NAME, "lecture-attachment-type-video"
+        video_links = self.driver.find_elements(
+            By.CSS_SELECTOR, ".lecture-attachment-type-video a"
         )
-        if not video_attachment:
-            logger.debug(f"No video attachment found for lecture: {title}")
+        if not video_links:
+            logger.debug(f"No video file link found for lecture: {title}")
             return False
 
-        video_link = video_attachment.find_element(By.TAG_NAME, "a")
-        if not video_link:
-            logger.debug(f"No video link found for lecture: {title}")
-            return False
-
-        latest_file = self.webdriver_download(
-            output_path=output_path,
-            trigger_download=lambda: video_link.click(),
-            timeout=timeout,
+        downloaded_file = self.webdriver_download(
+            output_path, video_links[0].click, timeout=timeout
         )
-        if not latest_file:
+        if not downloaded_file:
             return False
 
-        # Determine the file extension
-        _, extension = os.path.splitext(latest_file)
-
-        # Create the new filename
-        new_filename = f"{video_title}{extension}"
-        new_filepath = os.path.join(output_path, new_filename)
-
-        # Rename the file
-        os.rename(latest_file, new_filepath)
+        _, extension = os.path.splitext(downloaded_file)
+        new_filename = f"{name}{extension}"
+        os.rename(downloaded_file, os.path.join(output_path, new_filename))
         logger.info(f"Downloaded video file {new_filename}")
         return True
 
+    def video_ydl_options(self, **options):
+        return {
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            "postprocessors": [
+                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+                {"key": "FFmpegMetadata"},
+            ],
+            "http_headers": self.headers,
+            "verbose": self.verbose,
+            **options,
+        }
+
     # This function is needed because yt-dlp subtitle downloader is not working
     def download_subtitle(self, link, title, video_index, output_path):
-        ydl_opts = {
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                },
-                {
-                    "key": "FFmpegMetadata",
-                },
-            ],
-            "http_headers": self.headers,
-            "allsubtitles": True,
-            "subtitleslangs": ["all"],
-            "concurrentfragments": 10,
-            "writesubtitles": True,
-            "outtmpl": os.path.join(output_path, title),
-            "verbose": self.verbose,
-        }
+        ydl_opts = self.video_ydl_options(
+            allsubtitles=True, subtitleslangs=["all"], writesubtitles=True
+        )
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(link, download=False)
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(link, download=False)
-                info_json = ydl.sanitize_info(info)
-        except Exception as e:
-            logger.warning(
-                "Could not download subtitle: " + title + " cause: " + str(e)
+        for lang, sub in (info.get("requested_subtitles") or {}).items():
+            path = os.path.join(
+                output_path, f"{lecture_name(video_index, title)}.{lang}.{sub['ext']}"
             )
-            return
-
-        subtitle_links = {}
-        for lang, sub_info in info_json["requested_subtitles"].items():
-            subtitle_links[lang] = {
-                "url": sub_info["url"],
-                "ext": sub_info["ext"],
-            }
-
-        # Print the subtitle links and language names
-        for lang, sub in subtitle_links.items():
-            subtitle_filename = "{:02d}-{}.{}.{}".format(
-                video_index, title, lang, sub["ext"]
-            )
-            file_path = os.path.join(output_path, subtitle_filename)
-            if os.path.isfile(file_path):
-                logger.info("Skipping existing subtitle: " + subtitle_filename)
-            else:
-                base_url = sub["url"]
-                try:
-                    req = requests.get(sub["url"], headers=self.headers, timeout=30)
-                except Exception as e:
-                    logger.warning(
-                        "Could not download subtitle: " + title + " cause: " + str(e)
-                    )
-                    continue
-
-                relative_path = req.text.split("\n")[5]
-                full_url = urljoin(base_url, relative_path)
-                try:
-                    response = requests.get(full_url, headers=self.headers, timeout=30)
-                    with open(file_path, "wb") as f:
-                        f.write(response.content)
-                except Exception as e:
-                    logger.warning(
-                        "Could not download subtitle: " + title + " cause: " + str(e)
-                    )
-                    continue
-
-                logger.info("Downloaded subtitle: " + subtitle_filename)
+            if skip_existing(path, "subtitle"):
+                continue
+            # The subtitle URL points at a playlist whose sixth line is the actual file
+            try:
+                playlist = requests.get(sub["url"], headers=self.headers, timeout=30)
+                playlist.raise_for_status()
+                subtitle_url = urljoin(sub["url"], playlist.text.split("\n")[5])
+            except (requests.RequestException, IndexError) as e:
+                logger.warning(f"Could not download subtitle: {title} cause: {e}")
+                continue
+            self.download_file(subtitle_url, path, "subtitle", headers=self.headers)
 
     def download_video(self, link, title, video_index, output_path):
-        output_file = os.path.join(output_path, f"{video_index:02d}-{title}.mp4")
-        if os.path.isfile(output_file):
-            logger.info("Skipping existing video: " + output_file)
-            return
+        name = lecture_name(video_index, title)
+        if find_existing_video(output_path, name):
+            logger.info(f"Skipping existing video: {name}")
+            return True
 
-        ydl_opts = {
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                },
-                {
-                    "key": "FFmpegMetadata",
-                },
-            ],
-            "http_headers": self.headers,
-            "concurrentfragments": 15,
-            "outtmpl": os.path.join(output_path, f"{video_index:02d}-{title}.mp4"),
-            "verbose": self.verbose,
-        }
-
+        ydl_opts = self.video_ydl_options(
+            concurrentfragments=15,
+            outtmpl=os.path.join(output_path, f"{name}.mp4"),
+        )
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([link])
             return True
         except Exception as e:
-            logger.error("Could not download video: " + title + " cause: " + str(e))
+            logger.error(f"Could not download video: {title} cause: {e}")
             return False
 
     def webdriver_download(
-        self, output_path, trigger_download, expected_output_file_name=None, timeout=-1
+        self, output_path, trigger_download, expected_filename=None, timeout=120
     ):
-        # Set the download directory for the file
+        # Returns the downloaded file's path, or None if it didn't appear within timeout
+        os.makedirs(output_path, exist_ok=True)
         self.driver.execute_cdp_cmd(
             "Page.setDownloadBehavior",
-            {
-                "behavior": "allow",
-                "downloadPath": output_path,
-            },
+            {"behavior": "allow", "downloadPath": output_path},
         )
-
-        # Get list of files before download
         files_before_download = set(os.listdir(output_path))
 
-        # Click the link to trigger download
         trigger_download()
 
         # Wait for the download to complete
-        start_time = time.time()
-        while True:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             files_after_download = set(os.listdir(output_path))
-            if expected_output_file_name:
-                if expected_output_file_name in files_after_download:
-                    logger.debug(f"Expected file {expected_output_file_name} found.")
-                    return os.path.join(output_path, expected_output_file_name)
+            if expected_filename:
+                if expected_filename in files_after_download:
+                    logger.debug(f"Expected file {expected_filename} found.")
+                    return os.path.join(output_path, expected_filename)
             else:
-                logger.debug("No expected file name provided, checking for new files.")
-                # Find new files
                 new_files = files_after_download - files_before_download
-
                 if len(new_files) == 1:
                     new_file = next(iter(new_files))
                     if not new_file.endswith(".crdownload"):
                         logger.debug(f"New file found: {new_file}")
                         return os.path.join(output_path, new_file)
-
-            # Check for timeout
-            if timeout != -1 and (time.time() - start_time) > timeout:
-                logger.error("Download timed out.")
-                return False
-
             time.sleep(1)
+
+        logger.error("Download timed out.")
+        return None
 
     def complete_lecture(self):
         self.driver.switch_to.default_content()
-        complete_button = self.driver.find_element(By.ID, "lecture_complete_button")
-        if complete_button:
-            logger.info("Found complete button")
-            complete_button.click()
-            logger.info("Completed lecture")
-            time.sleep(3)
+        self.driver.find_element(By.ID, "lecture_complete_button").click()
+        logger.info("Completed lecture")
+        time.sleep(3)
 
     def cleanup(self):
         logger.info("Cleaning up")
         self.driver.quit()
-        # Delete cookies.txt
         if os.path.exists("cookies.txt"):
             os.remove("cookies.txt")
-
-
-BATCH_FILE_FIELDS = ("url", "email", "password", "login_url")
 
 
 def read_batch_file(file_path):
@@ -1626,7 +1314,7 @@ def read_batch_file(file_path):
         logger.error(f"File not found: {file_path}")
         return []
     except OSError as e:
-        logger.error(f"Could not read file: {file_path}. Error: {e!s}")
+        logger.error(f"Could not read file: {file_path}. Error: {e}")
         return []
 
     if lines and lines[0].split(",")[0].strip().lower() == "url":
@@ -1652,11 +1340,15 @@ def read_batch_file(file_path):
     return entries
 
 
-def check_required_args(args):
+def get_args_error(args):
+    if not args.file and not args.url:
+        return "A course URL (--url) or a batch file (--file) is required."
     # A batch file can carry its own credentials per course
-    if args.manual_login or args.file:
-        return True
-    return bool(args.email and args.password)
+    if not (args.manual_login or args.file or (args.email and args.password)):
+        return (
+            "Required arguments are missing. Choose email/password or --manual-login."
+        )
+    return None
 
 
 if __name__ == "__main__":
@@ -1716,36 +1408,33 @@ if __name__ == "__main__":
         default=10,
     )
     args = parser.parse_args()
-    verbose = False
-    if args.verbose == 0:
-        log_level = logging.WARNING
-    elif args.verbose == 1:
-        log_level = logging.INFO
-    else:
-        verbose = True
-        log_level = logging.DEBUG
 
     # force=True: on some Python builds hashlib installs a root handler at startup,
     # which makes a plain basicConfig() silently do nothing
     logging.basicConfig(
-        level=log_level, format="%(levelname)s: %(message)s", force=True
+        level={0: logging.WARNING, 1: logging.INFO}.get(args.verbose, logging.DEBUG),
+        format="%(levelname)s: %(message)s",
+        force=True,
     )
 
-    if not check_required_args(args):
-        logger.error(
-            "Required arguments are missing. Choose email/password or --manual-login."
-        )
+    # Validate everything before opening the browser
+    if args_error := get_args_error(args):
+        logger.error(args_error)
+        sys.exit(1)
+
+    entries = read_batch_file(args.file) if args.file else None
+    if args.file and not entries:
         sys.exit(1)
 
     downloader = TeachableDownloader(
-        verbose_arg=verbose,
+        verbose_arg=args.verbose >= 2,
         complete_lecture_arg=args.complete_lecture,
         user_agent_arg=args.user_agent,
         timeout_arg=args.timeout,
     )
-    if args.file:
-        entries = read_batch_file(args.file)
-        try:
+    exit_code = 0
+    try:
+        if entries:
             downloader.run_batch(
                 entries,
                 args.email,
@@ -1753,22 +1442,7 @@ if __name__ == "__main__":
                 args.login_url,
                 manual_login=args.manual_login,
             )
-            downloader.cleanup()
-            sys.exit(0)
-        except KeyboardInterrupt:
-            logger.error("Interrupted by user")
-            downloader.cleanup()
-            sys.exit(1)
-        except Exception as e:
-            logger.error("Error: " + str(e))
-            downloader.cleanup()
-            sys.exit(1)
-    else:
-        # Check if url argument is passed
-        if not args.url:
-            logger.error("URL is required")
-            sys.exit(1)
-        try:
+        else:
             downloader.run(
                 course_url=args.url,
                 email=args.email,
@@ -1776,13 +1450,15 @@ if __name__ == "__main__":
                 login_url=args.login_url,
                 manual_login=args.manual_login,
             )
-            downloader.cleanup()
-            sys.exit(0)
-        except KeyboardInterrupt:
-            logger.error("Interrupted by user")
-            downloader.cleanup()
-            sys.exit(1)
-        except Exception as e:
-            logger.error("Error: " + str(e))
-            downloader.cleanup()
-            sys.exit(1)
+    except KeyboardInterrupt:
+        logger.error("Interrupted by user")
+        exit_code = 1
+    except Exception as e:
+        if downloader.is_dead_session_error(e):
+            logger.error("Browser session was lost (crashed or closed), stopping.")
+        else:
+            logger.error(f"Error: {e}")
+        exit_code = 1
+    finally:
+        downloader.cleanup()
+    sys.exit(exit_code)
