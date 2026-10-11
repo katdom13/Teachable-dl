@@ -1186,9 +1186,7 @@ class TeachableDownloader:
                 )
                 # Use the webdriver to download the PDF
                 os.makedirs(output_path, exist_ok=True)
-                self.webdriver_download(
-                    output_path, lambda: pdf_link.click(), pdf_filename
-                )
+                self.webdriver_download(output_path, pdf_link.click, pdf_filename)
         else:
             logger.info("No PDF attachments found for video: " + title)
 
@@ -1562,11 +1560,11 @@ class TeachableDownloader:
                 # Find new files
                 new_files = files_after_download - files_before_download
 
-                if len(new_files) == 1 and not list(new_files)[0].endswith(
-                    ".crdownload"
-                ):
-                    logger.debug(f"New file found: {list(new_files)[0]}")
-                    return os.path.join(output_path, list(new_files)[0])
+                if len(new_files) == 1:
+                    new_file = next(iter(new_files))
+                    if not new_file.endswith(".crdownload"):
+                        logger.debug(f"New file found: {new_file}")
+                        return os.path.join(output_path, new_file)
 
             # Check for timeout
             if timeout != -1 and (time.time() - start_time) > timeout:
