@@ -1,5 +1,7 @@
 import argparse
+import base64
 import csv
+import glob
 import json
 import logging
 import os
@@ -7,7 +9,7 @@ import re
 import string
 import sys
 import time
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 import requests
 import selenium.webdriver.support.expected_conditions as EC
@@ -789,12 +791,178 @@ class TeachableDownloader:
         logger.info("Downloading video")
         return self.download_video(link, video_title, idx, download_path)
 
+    def is_lecture_already_saved(self, video):
+        title = video["title"]
+        video_index = video["idx"]
+        output_path = video["download_path"]
+
+        html_path = os.path.join(output_path, f"{video_index:02d}_{title}.html")
+        if not os.path.exists(html_path):
+            return False
+        try:
+            with open(html_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            logger.debug(f"Could not read saved lecture html: {html_path} cause: {e!s}")
+            return False
+        if "content locked" in content.lower():
+            return False
+        body_match = re.search(
+            r"<body[^>]*>(.*)</body>", content, re.DOTALL | re.IGNORECASE
+        )
+        if (
+            not body_match
+            or len(re.sub(r"<[^>]+>", "", body_match.group(1)).strip()) < 20
+        ):
+            logging.debug(
+                f"{title}: saved html body is empty/near-empty, treating as incomplete"
+            )
+            return False
+
+        video_title = f"{video_index:02d}-{title}"
+
+        # Videos: one file per video widget, "-n" suffixed when there's more
+        # than one (matching download_videos_from_links' own naming).
+        video_widget_count = len(re.findall(r"lecture-attachment-type-video", content))
+        for i in range(1, video_widget_count + 1):
+            suffix = f"-{i}" if video_widget_count > 1 else ""
+            expected_title = f"{video_title}{suffix}"
+            has_mp4 = os.path.isfile(os.path.join(output_path, f"{expected_title}.mp4"))
+            has_other_video_file = bool(
+                glob.glob(
+                    os.path.join(
+                        glob.escape(output_path), glob.escape(expected_title) + ".*"
+                    )
+                )
+            )
+            if not has_mp4 and not has_other_video_file:
+                logger.debug(
+                    f"{title}: missing expected video {expected_title}, will re-check"
+                )
+                return False
+
+        attachment_output_path = os.path.join(output_path, video_title)
+
+        # File-type attachments (downloaded via wget). A lecture can have
+        # more than one separate file-attachment block.
+        for file_block in re.finditer(
+            r'lecture-attachment-type-file["\'][^>]*>(.*?)</div>\s*</div>',
+            content,
+            re.DOTALL,
+        ):
+            for href in re.findall(r'href="([^"]+)"', file_block.group(1)):
+                filename = os.path.basename(urlparse(href).path)
+                if filename and not os.path.isfile(
+                    os.path.join(attachment_output_path, filename)
+                ):
+                    logger.debug(
+                        f"{title}: missing expected attachment {filename}, will re-check"
+                    )
+                    return False
+
+        # Audio attachments (the mp3 player widget)
+        for audio_match in re.finditer(
+            r'audioloader__placeholder["\'][^>]*>(.*?)</div>', content, re.DOTALL
+        ):
+            block = audio_match.group(1)
+            href_match = re.search(r'data-href="([^"]+)"', block)
+            if not href_match:
+                continue
+            name_match = re.search(r'audioloader__name["\'][^>]*>([^<]*)<', block)
+            audio_filename = name_match.group(1).strip() if name_match else ""
+            if not audio_filename:
+                audio_filename = os.path.basename(urlparse(href_match.group(1)).path)
+            if audio_filename and not os.path.isfile(
+                os.path.join(attachment_output_path, audio_filename)
+            ):
+                logging.debug(
+                    f"{title}: missing expected audio attachment {audio_filename}, will re-check"
+                )
+                return False
+
+        # PDF-embed attachments
+        for pdf_block in re.finditer(
+            r'lecture-attachment-type-pdf_embed["\'][^>]*>(.*?)</div>\s*</div>',
+            content,
+            re.DOTALL,
+        ):
+            name_match = re.search(
+                r'data-x-origin-download-name="([^"]+)"', pdf_block.group(1)
+            )
+            if name_match and not os.path.isfile(
+                os.path.join(attachment_output_path, name_match.group(1))
+            ):
+                logging.debug(
+                    f"{title}: missing expected PDF {name_match.group(1)}, will re-check"
+                )
+                return False
+
+        # Inline content images. Number them like download_attachments does (one counter
+        # from 1, in page order) so the "image-{idx}.{ext}" fallback names match.
+        image_idx = 0
+        for text_block in re.finditer(
+            r'lecture-text-container["\'][^>]*>(.*?)</div>', content, re.DOTALL
+        ):
+            for img in re.findall(r"<img[^>]*>", text_block.group(1)):
+                image_idx += 1
+                loader_src_match = re.search(r'data-imageloader-src="([^"]+)"', img)
+                src_match = re.search(r'\bsrc="([^"]+)"', img)
+                loader_src = loader_src_match.group(1) if loader_src_match else ""
+                src = src_match.group(1) if src_match else ""
+
+                image_link = next(
+                    (c for c in (loader_src, src) if c and not c.startswith("data:")),
+                    None,
+                )
+                if image_link:
+                    image_filename = os.path.basename(
+                        urlparse(unquote(image_link)).path
+                    )
+                    if not image_filename:
+                        image_filename = f"image-{image_idx}.png"
+                    if not os.path.isfile(
+                        os.path.join(attachment_output_path, image_filename)
+                    ):
+                        logging.debug(
+                            f"{title}: missing expected image {image_filename}, will re-check"
+                        )
+                        return False
+                    continue
+
+                # No real URL, but a full base64 image is decoded and saved under this fallback name.
+                data_uri = loader_src if loader_src.startswith("data:") else src
+                match = (
+                    re.match(r"data:image/([a-zA-Z0-9.+-]+);base64,", data_uri)
+                    if data_uri
+                    else None
+                )
+                if not match:
+                    continue
+                ext = match.group(1).replace("jpeg", "jpg")
+                image_filename = f"image-{image_idx}.{ext}"
+                if not os.path.isfile(
+                    os.path.join(attachment_output_path, image_filename)
+                ):
+                    logging.debug(
+                        f"{title}: missing expected inline image {image_filename}, will re-check"
+                    )
+                    return False
+
+        return True
+
     def download_videos_from_links(self, video_list):
         for video in video_list:
+            if self.is_lecture_already_saved(video):
+                logger.info("Skipping already saved lecture: " + video["title"])
+                continue
+
             link = video["link"]
             title = video["title"]
             download_path = video["download_path"]
             idx = video["idx"]
+
+            # Created lazily, right before it's actually needed
+            os.makedirs(download_path, exist_ok=True)
 
             if self.driver.current_url != link:
                 logger.info("Navigating to lecture: " + title)
@@ -812,6 +980,8 @@ class TeachableDownloader:
                     logger.warning(
                         "No attachments or video found for lecture: " + title
                     )
+
+                self.scroll_page_to_trigger_lazy_content()
 
             logger.info("Downloading lecture: " + title)
             try:
@@ -900,6 +1070,23 @@ class TeachableDownloader:
                         + str(e)
                     )
 
+    def scroll_page_to_trigger_lazy_content(self):
+        try:
+            last_height = self.driver.execute_script(
+                "return document.body.scrollHeight"
+            )
+            scroll_position = 0
+            while scroll_position < last_height:
+                scroll_position += 900
+                self.driver.execute_script(f"window.scrollTo(0, {scroll_position});")
+                time.sleep(0.3)
+                last_height = self.driver.execute_script(
+                    "return document.body.scrollHeight"
+                )
+            self.driver.execute_script("window.scrollTo(0, 0);")
+        except Exception as e:
+            logger.debug("Could not scroll page to trigger lazy content: " + str(e))
+
     def save_webpage_as_html(self, title, video_index, output_path):
         output_file = os.path.join(output_path, f"{video_index:02d}-{title}.html")
         with open(output_file, "w+", encoding="utf-8") as f:
@@ -908,6 +1095,7 @@ class TeachableDownloader:
 
     def download_attachments(self, link, title, video_index, output_path):
         video_title = f"{video_index:02d}-{title}"
+        output_path = os.path.join(output_path, video_title)
 
         # Grab the video attachments type file
         video_attachments = self.driver.find_elements(
@@ -915,15 +1103,26 @@ class TeachableDownloader:
         )
         if video_attachments:
             # Get all links from the video attachments
-            video_links = video_attachments[0].find_elements(By.TAG_NAME, "a")
-            output_path = os.path.join(output_path, video_title)
-            os.makedirs(output_path, exist_ok=True)
+            # A lecture can have more than one separate file-attachment block
+            video_links = [
+                a
+                for block in video_attachments
+                for a in block.find_elements(By.TAG_NAME, "a")
+            ]
 
             # Get href attribute from the first link
             if video_links:
                 for video_link in video_links:
                     link = video_link.get_attribute("href")
                     filename = video_link.text
+                    # wget names the file after the URL, not the link text, so
+                    # check against that to detect an already-downloaded file.
+                    url_filename = os.path.basename(urlparse(link).path)
+                    if url_filename and os.path.isfile(
+                        os.path.join(output_path, url_filename)
+                    ):
+                        logger.info("Skipping existing attachment: " + url_filename)
+                        continue
                     logger.info(
                         "Downloading attachment: " + filename + " for video: " + title
                     )
@@ -932,8 +1131,235 @@ class TeachableDownloader:
         else:
             logger.warning("No attachments found for video: " + title)
 
+        # Grab the video attachments type pdf_embed
+        pdf_attachments = self.driver.find_elements(
+            By.CLASS_NAME, "lecture-attachment-type-pdf_embed"
+        )
+        if pdf_attachments:
+            for attachment in pdf_attachments:
+                pdf_link = attachment.find_element(By.TAG_NAME, "a")
+                pdf_filename = pdf_link.get_attribute("data-x-origin-download-name")
+                if pdf_filename and os.path.isfile(
+                    os.path.join(output_path, pdf_filename)
+                ):
+                    logger.info("Skipping existing PDF attachment: " + pdf_filename)
+                    continue
+                logger.info(
+                    "Downloading PDF attachment: "
+                    + pdf_filename
+                    + " for video: "
+                    + title
+                )
+                # Use the webdriver to download the PDF
+                os.makedirs(output_path, exist_ok=True)
+                self.webdriver_download(
+                    output_path, lambda: pdf_link.click(), pdf_filename
+                )
+        else:
+            logger.warning("No PDF attachments found for video: " + title)
+
+        # Grab audio attachments (the mp3 player widget), whose actual file
+        # URL sits in the button's data-href rather than an <a href>.
+        audio_widgets = self.driver.find_elements(
+            By.CLASS_NAME, "audioloader__placeholder"
+        )
+        if audio_widgets:
+            os.makedirs(output_path, exist_ok=True)
+            for audio_widget in audio_widgets:
+                try:
+                    audio_button = audio_widget.find_element(By.TAG_NAME, "button")
+                    audio_link = audio_button.get_attribute("data-href")
+                    if not audio_link:
+                        continue
+                    try:
+                        audio_filename = audio_widget.find_element(
+                            By.CLASS_NAME, "audioloader__name"
+                        ).text.strip()
+                    except Exception:
+                        audio_filename = ""
+                    if not audio_filename:
+                        audio_filename = os.path.basename(urlparse(audio_link).path)
+                    if audio_filename and os.path.isfile(
+                        os.path.join(output_path, audio_filename)
+                    ):
+                        logger.info("Skipping existing audio file: " + audio_filename)
+                        continue
+                    logger.info("Downloading audio attachment: " + audio_filename)
+                    response = requests.get(
+                        audio_link, headers=self.headers, timeout=30
+                    )
+                    if response.ok:
+                        with open(os.path.join(output_path, audio_filename), "wb") as f:
+                            f.write(response.content)
+                    else:
+                        logger.warning(
+                            "Failed to download audio attachment: " + audio_filename
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Could not download audio attachment for video: "
+                        + title
+                        + " cause: "
+                        + str(e)
+                    )
+        else:
+            logger.info("No audio attachments found for video: " + title)
+
+        # Grab images embedded directly in the lecture's rich-text content
+        logger.debug("Scanning for content images")
+        image_elements = []
+        try:
+            text_containers = self.driver.find_elements(
+                By.CLASS_NAME, "lecture-text-container"
+            )
+            for text_container in text_containers:
+                try:
+                    image_elements.extend(
+                        text_container.find_elements(By.TAG_NAME, "img")
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Could not read one lecture-text-container's images: " + str(e)
+                    )
+        except Exception as e:
+            logger.warning("Could not scan for content images: " + str(e))
+        logger.debug(f"Found {len(image_elements)} content image(s)")
+
+        if image_elements:
+            for idx, image_element in enumerate(image_elements, start=1):
+                try:
+                    loader_src = (
+                        image_element.get_attribute("data-imageloader-src") or ""
+                    )
+                    src = image_element.get_attribute("src") or ""
+                except Exception as e:
+                    logger.debug(f"Could not read image {idx} src: " + str(e))
+                    continue
+
+                # Scrolling the whole page once doesn't load every lazy image, so scroll each
+                # image that still has a base64 placeholder into view and wait for its real URL.
+                if (not loader_src or loader_src.startswith("data:")) and (
+                    not src or src.startswith("data:")
+                ):
+                    try:
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block: 'center'});",
+                            image_element,
+                        )
+                        deadline = time.time() + 8
+                        while time.time() < deadline:
+                            time.sleep(0.5)
+                            loader_src = (
+                                image_element.get_attribute("data-imageloader-src")
+                                or ""
+                            )
+                            src = image_element.get_attribute("src") or ""
+                            if (loader_src and not loader_src.startswith("data:")) or (
+                                src and not src.startswith("data:")
+                            ):
+                                logger.debug(
+                                    f"Image {idx} resolved to a real URL after a dedicated wait"
+                                )
+                                break
+                    except Exception as e:
+                        logger.debug(
+                            f"Could not re-check image {idx} after scrolling into view: "
+                            + str(e)
+                        )
+
+                image_link = next(
+                    (c for c in (loader_src, src) if c and not c.startswith("data:")),
+                    None,
+                )
+                if image_link:
+                    image_filename = os.path.basename(
+                        urlparse(unquote(image_link)).path
+                    )
+                    if not image_filename:
+                        image_filename = f"image_{idx}.jpg"
+                    if os.path.isfile(os.path.join(output_path, image_filename)):
+                        logger.info("Skipping existing image: " + image_filename)
+                        continue
+                    logger.info(
+                        "Downloading image: " + image_filename + " for video: " + title
+                    )
+                    try:
+                        response = requests.get(
+                            image_link, headers=self.headers, timeout=30
+                        )
+                        if response.ok:
+                            # Create the folder only before the first write, so lectures whose
+                            # images never load don't leave an empty folder.
+                            os.makedirs(output_path, exist_ok=True)
+                            with open(
+                                os.path.join(output_path, image_filename), "wb"
+                            ) as f:
+                                f.write(response.content)
+                        else:
+                            logger.warning(
+                                "Failed to download image: " + image_filename
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Could not download image: "
+                            + image_filename
+                            + " cause: "
+                            + str(e)
+                        )
+                    continue
+
+                # No real URL appeared, but Teachable sometimes inlines the full image as a
+                # data: URI (not just a blurred preview), so decode and save that instead.
+                data_uri = loader_src if loader_src.startswith("data:") else src
+                match = (
+                    re.match(
+                        r"data:image/([a-zA-Z0-9.+-]+);base64,(.+)", data_uri, re.DOTALL
+                    )
+                    if data_uri
+                    else None
+                )
+                if not match:
+                    if data_uri:
+                        logger.debug(
+                            f"Skipping image {idx}: unrecognized data URI format"
+                        )
+                    continue
+                ext = match.group(1).replace("jpeg", "jpg")
+                image_filename = f"image-{idx}.{ext}"
+                if os.path.isfile(os.path.join(output_path, image_filename)):
+                    logger.info("Skipping existing image: " + image_filename)
+                    continue
+                try:
+                    image_bytes = base64.b64decode(match.group(2))
+                except Exception as e:
+                    logger.warning(f"Could not decode inline image {idx}: {e!s}")
+                    continue
+                logger.info(
+                    f"Saving inline (base64) image: {image_filename} for video: {title}"
+                )
+                os.makedirs(output_path, exist_ok=True)
+                with open(os.path.join(output_path, image_filename), "wb") as f:
+                    f.write(image_bytes)
+        else:
+            logger.info(f"No content images found for video: {title}")
+
     def download_video_file(self, title, video_index, output_path, timeout=60):
         video_title = f"{video_index:02d}-{title}"
+
+        # The extension isn't known until download, so match on the title with video extensions
+        video_extensions = ("mp4", "mkv", "webm", "mov", "avi", "m4v")
+        existing_video_files = [
+            f
+            for ext in video_extensions
+            for f in glob.glob(
+                os.path.join(
+                    glob.escape(output_path), glob.escape(video_title) + "." + ext
+                )
+            )
+        ]
+        if existing_video_files:
+            logger.info("Skipping existing video file: " + video_title)
+            return True
 
         # Grab the video attachments type video
         video_attachment = self.driver.find_element(
@@ -948,40 +1374,11 @@ class TeachableDownloader:
             logger.debug(f"No video link found for lecture: {title}")
             return False
 
-        # Set the download directory for this file
-        self.driver.execute_cdp_cmd(
-            "Page.setDownloadBehavior",
-            {
-                "behavior": "allow",
-                "downloadPath": output_path,
-            },
+        latest_file = self.webdriver_download(
+            output_path=output_path,
+            trigger_download=lambda: video_link.click(),
+            timeout=timeout,
         )
-        # Get list of files before download
-        files_before_download = set(os.listdir(output_path))
-
-        # Click the link to trigger download
-        video_link.click()
-
-        # Wait for download to complete
-        start_time = time.time()
-        while True:
-            files_after_download = set(os.listdir(output_path))
-
-            # Find new files
-            new_files = files_after_download - files_before_download
-
-            if len(new_files) > 0 and all(
-                os.path.splitext(f)[1] != ".crdownload" for f in new_files
-            ):
-                break
-
-            if timeout > 0 and (time.time() - start_time) > timeout:
-                logger.warning(f"Download timeout for lecture: {title}")
-                return False
-
-            time.sleep(1)
-
-        latest_file = os.path.join(output_path, next(iter(new_files)))
 
         # Determine the file extension
         _, extension = os.path.splitext(latest_file)
@@ -1098,6 +1495,50 @@ class TeachableDownloader:
         except Exception as e:
             logger.error("Could not download video: " + title + " cause: " + str(e))
             return False
+
+    def webdriver_download(
+        self, output_path, trigger_download, expected_output_file_name=None, timeout=-1
+    ):
+        # Set the download directory for the file
+        self.driver.execute_cdp_cmd(
+            "Page.setDownloadBehavior",
+            {
+                "behavior": "allow",
+                "downloadPath": output_path,
+            },
+        )
+
+        # Get list of files before download
+        files_before_download = set(os.listdir(output_path))
+
+        # Click the link to trigger download
+        trigger_download()
+
+        # Wait for the download to complete
+        start_time = time.time()
+        while True:
+            files_after_download = set(os.listdir(output_path))
+            if expected_output_file_name:
+                if expected_output_file_name in files_after_download:
+                    logger.debug(f"Expected file {expected_output_file_name} found.")
+                    return os.path.join(output_path, expected_output_file_name)
+            else:
+                logger.debug("No expected file name provided, checking for new files.")
+                # Find new files
+                new_files = files_after_download - files_before_download
+
+                if len(new_files) == 1 and not list(new_files)[0].endswith(
+                    ".crdownload"
+                ):
+                    logger.debug(f"New file found: {list(new_files)[0]}")
+                    return os.path.join(output_path, list(new_files)[0])
+
+            # Check for timeout
+            if timeout != -1 and (time.time() - start_time) > timeout:
+                logger.error("Download timed out.")
+                return None
+
+            time.sleep(1)
 
     def complete_lecture(self):
         self.driver.switch_to.default_content()
