@@ -186,6 +186,15 @@ python3 main.py --url <course_url> --manual-login --verbose
 
 > Log in yourself in the browser window that opens (including any captcha). The download starts automatically once you're logged in.
 
+or download part of a course, by chapter number or part of its title
+
+```sh
+python3 main.py --url <course_url> --manual-login --start-chapter 3
+python3 main.py --url <course_url> --manual-login --only-chapter "Speaking Tips"
+```
+
+> `--start-chapter` downloads from that chapter to the end of the course, `--only-chapter` downloads just that chapter. They can't be used together or with `--file`.
+
 or download several courses from a file
 
 ```sh

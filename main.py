@@ -133,6 +133,15 @@ def audio_attachment_filename(name, href):
     return (name or "").strip() or os.path.basename(urlparse(href).path)
 
 
+def chapter_matches(video, query):
+    # A number picks the chapter by position; text matches part of the folder name,
+    # cleaned the same way so "Speaking Tips" matches "03-Speaking-Tips"
+    if query.isdigit():
+        return video["chapter_idx"] == int(query)
+    chapter = os.path.basename(video["download_path"])
+    return clean_string(query).lower() in chapter.lower()
+
+
 class TeachableDownloader:
     def __init__(
         self,
@@ -142,6 +151,8 @@ class TeachableDownloader:
         origin_arg="",
         referer_arg="",
         timeout_arg=10,
+        start_chapter_arg=None,
+        only_chapter_arg=None,
     ):
         # external_pdf: download PDFs instead of opening them in Chrome's viewer
         self.driver = Driver(uc=True, headed=True, external_pdf=True)
@@ -159,6 +170,8 @@ class TeachableDownloader:
         self.verbose = verbose_arg
         self._complete_lecture = complete_lecture_arg
         self.global_timeout = timeout_arg
+        self.start_chapter = start_chapter_arg
+        self.only_chapter = only_chapter_arg
 
     # --- Helpers ---
 
@@ -605,6 +618,7 @@ class TeachableDownloader:
                     "link": link,
                     "title": title,
                     "download_path": download_path,
+                    "chapter_idx": chapter_idx,
                     "idx": idx,
                 }
             )
@@ -833,6 +847,30 @@ class TeachableDownloader:
 
         return True
 
+    def filter_chapters(self, video_list):
+        query = self.only_chapter or self.start_chapter
+        if not query:
+            return video_list
+
+        first = next(
+            (i for i, v in enumerate(video_list) if chapter_matches(v, query)), None
+        )
+        if first is None:
+            chapters = dict.fromkeys(
+                os.path.basename(v["download_path"]) for v in video_list
+            )
+            logger.error(
+                f"No chapter matches '{query}', nothing downloaded. Chapters: {', '.join(chapters)}"
+            )
+            return []
+
+        chapter_path = video_list[first]["download_path"]
+        if self.only_chapter:
+            logger.info(f"Downloading only chapter: {os.path.basename(chapter_path)}")
+            return [v for v in video_list if v["download_path"] == chapter_path]
+        logger.info(f"Starting from chapter: {os.path.basename(chapter_path)}")
+        return video_list[first:]
+
     def open_lecture(self, link, title):
         self.driver.get(link)
         # Wait for the lecture content the steps below look for (attachments or a video player)
@@ -842,7 +880,7 @@ class TeachableDownloader:
             logger.warning(f"No attachments or video found for lecture: {title}")
 
     def download_videos_from_links(self, video_list):
-        for video in video_list:
+        for video in self.filter_chapters(video_list):
             link = video["link"]
             title = video["title"]
             download_path = video["download_path"]
@@ -1343,6 +1381,8 @@ def read_batch_file(file_path):
 def get_args_error(args):
     if not args.file and not args.url:
         return "A course URL (--url) or a batch file (--file) is required."
+    if args.file and (args.start_chapter or args.only_chapter):
+        return "--start-chapter and --only-chapter only work with a single --url."
     # A batch file can carry its own credentials per course
     if not (args.manual_login or args.file or (args.email and args.password)):
         return (
@@ -1407,6 +1447,17 @@ if __name__ == "__main__":
         type=int,
         default=10,
     )
+    chapter_group = parser.add_mutually_exclusive_group()
+    chapter_group.add_argument(
+        "--start-chapter",
+        help="Start from the first chapter matching this number or text "
+        '(e.g. 3 or "Speaking Tips") and continue to the end of the course',
+    )
+    chapter_group.add_argument(
+        "--only-chapter",
+        help="Download only the first chapter matching this number or text "
+        '(e.g. 3 or "Speaking Tips")',
+    )
     args = parser.parse_args()
 
     # force=True: on some Python builds hashlib installs a root handler at startup,
@@ -1431,6 +1482,8 @@ if __name__ == "__main__":
         complete_lecture_arg=args.complete_lecture,
         user_agent_arg=args.user_agent,
         timeout_arg=args.timeout,
+        start_chapter_arg=args.start_chapter,
+        only_chapter_arg=args.only_chapter,
     )
     exit_code = 0
     try:
