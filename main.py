@@ -5,6 +5,7 @@ import glob
 import json
 import logging
 import os
+import random
 import re
 import string
 import sys
@@ -16,11 +17,14 @@ import selenium.webdriver.support.expected_conditions as EC
 import wget
 import yt_dlp
 from selenium.common import TimeoutException
+from selenium.common.exceptions import InvalidSessionIdException
 from selenium.webdriver.remote.webdriver import By
 from selenium.webdriver.support.wait import WebDriverWait
 from seleniumbase import Driver
 
 logger = logging.getLogger(__name__)
+
+VIDEO_EXTENSIONS = ("mp4", "mkv", "webm", "mov", "avi", "m4v")
 
 # Elements that download_videos_from_links() downloads from on a lecture page
 LECTURE_CONTENT_SELECTOR = (
@@ -76,7 +80,12 @@ class TeachableDownloader:
         referer_arg="",
         timeout_arg=10,
     ):
-        self.driver = Driver(uc=True, headed=True)
+        # external_pdf: download PDFs instead of opening them in Chrome's viewer
+        self.driver = Driver(uc=True, headed=True, external_pdf=True)
+        try:
+            self.driver.command_executor.client_config.timeout = 120
+        except Exception as e:
+            logger.debug("Could not set a command executor timeout: " + str(e))
         self.headers = {
             "User-Agent": user_agent_arg,
             "Origin": origin_arg or "https://player.hotmart.com",
@@ -213,15 +222,15 @@ class TeachableDownloader:
         logger.debug("Filling in login form")
         email_element.click()
         email_element.clear()
-        self.driver.execute_script(
-            "arguments[0].value = arguments[1]", email_element, email
-        )
+        # Type with send_keys (real keyboard events) rather than setting .value with JS,
+        # since risk-based captchas score whether the submission looks human
+        self.type_like_human(email_element, email)
+        time.sleep(random.uniform(0.3, 0.8))
 
         password_element.click()
         password_element.clear()
-        self.driver.execute_script(
-            "arguments[0].value = arguments[1]", password_element, password
-        )
+        self.type_like_human(password_element, password)
+        time.sleep(random.uniform(0.4, 1.0))
 
         commit_element.click()
 
@@ -252,6 +261,11 @@ class TeachableDownloader:
                 "continue\033[0m"
             )
         logger.info("Logged in, switching to course page")
+
+    def type_like_human(self, element, text):
+        for char in text:
+            element.send_keys(char)
+            time.sleep(random.uniform(0.03, 0.12))
 
     def logged_out_reason(self):
         # A sign-in form (email + password together, not just a stray "email"
@@ -413,6 +427,11 @@ class TeachableDownloader:
                 try:
                     self.pick_course_downloader(url)
                 except Exception as e:
+                    if self.is_dead_session_error(e):
+                        logger.error(
+                            "Browser session was lost (crashed or closed), stopping."
+                        )
+                        return
                     logger.error(
                         "Could not download course: " + url + " cause: " + str(e)
                     )
@@ -796,7 +815,7 @@ class TeachableDownloader:
         video_index = video["idx"]
         output_path = video["download_path"]
 
-        html_path = os.path.join(output_path, f"{video_index:02d}_{title}.html")
+        html_path = os.path.join(output_path, f"{video_index:02d}-{title}.html")
         if not os.path.exists(html_path):
             return False
         try:
@@ -814,7 +833,7 @@ class TeachableDownloader:
             not body_match
             or len(re.sub(r"<[^>]+>", "", body_match.group(1)).strip()) < 20
         ):
-            logging.debug(
+            logger.debug(
                 f"{title}: saved html body is empty/near-empty, treating as incomplete"
             )
             return False
@@ -827,15 +846,12 @@ class TeachableDownloader:
         for i in range(1, video_widget_count + 1):
             suffix = f"-{i}" if video_widget_count > 1 else ""
             expected_title = f"{video_title}{suffix}"
-            has_mp4 = os.path.isfile(os.path.join(output_path, f"{expected_title}.mp4"))
-            has_other_video_file = bool(
-                glob.glob(
-                    os.path.join(
-                        glob.escape(output_path), glob.escape(expected_title) + ".*"
-                    )
-                )
+            # Video extensions only: ".*" would also match this lecture's own .html snapshot
+            has_video_file = any(
+                os.path.isfile(os.path.join(output_path, f"{expected_title}.{ext}"))
+                for ext in VIDEO_EXTENSIONS
             )
-            if not has_mp4 and not has_other_video_file:
+            if not has_video_file:
                 logger.debug(
                     f"{title}: missing expected video {expected_title}, will re-check"
                 )
@@ -875,7 +891,7 @@ class TeachableDownloader:
             if audio_filename and not os.path.isfile(
                 os.path.join(attachment_output_path, audio_filename)
             ):
-                logging.debug(
+                logger.debug(
                     f"{title}: missing expected audio attachment {audio_filename}, will re-check"
                 )
                 return False
@@ -892,7 +908,7 @@ class TeachableDownloader:
             if name_match and not os.path.isfile(
                 os.path.join(attachment_output_path, name_match.group(1))
             ):
-                logging.debug(
+                logger.debug(
                     f"{title}: missing expected PDF {name_match.group(1)}, will re-check"
                 )
                 return False
@@ -923,7 +939,7 @@ class TeachableDownloader:
                     if not os.path.isfile(
                         os.path.join(attachment_output_path, image_filename)
                     ):
-                        logging.debug(
+                        logger.debug(
                             f"{title}: missing expected image {image_filename}, will re-check"
                         )
                         return False
@@ -943,12 +959,18 @@ class TeachableDownloader:
                 if not os.path.isfile(
                     os.path.join(attachment_output_path, image_filename)
                 ):
-                    logging.debug(
+                    logger.debug(
                         f"{title}: missing expected inline image {image_filename}, will re-check"
                     )
                     return False
 
         return True
+
+    def is_dead_session_error(self, e):
+        return (
+            isinstance(e, InvalidSessionIdException)
+            or "invalid session id" in str(e).lower()
+        )
 
     def download_videos_from_links(self, video_list):
         for video in video_list:
@@ -988,6 +1010,8 @@ class TeachableDownloader:
                 logger.info("Saving html")
                 self.save_webpage_as_html(title, idx, download_path)
             except Exception as e:
+                if self.is_dead_session_error(e):
+                    raise
                 logger.error(
                     "Could not save html: " + title + " cause: " + str(e),
                     exc_info=self.verbose,
@@ -997,6 +1021,8 @@ class TeachableDownloader:
                 logger.info("Downloading attachments")
                 self.download_attachments(link, title, idx, download_path)
             except Exception as e:
+                if self.is_dead_session_error(e):
+                    raise
                 logger.warning(
                     "Could not download attachments: " + title + " cause: " + str(e)
                 )
@@ -1006,6 +1032,8 @@ class TeachableDownloader:
                 if self.download_video_file(title, idx, download_path):
                     continue
             except Exception as e:
+                if self.is_dead_session_error(e):
+                    raise
                 logger.debug(
                     "Could not download video as an attachment: "
                     + title
@@ -1048,6 +1076,8 @@ class TeachableDownloader:
                         ):
                             break
                     except Exception as e:
+                        if self.is_dead_session_error(e):
+                            raise
                         logger.warning(
                             "Could not find video: " + title + " cause: " + str(e)
                         )
@@ -1063,6 +1093,8 @@ class TeachableDownloader:
                     logger.info("Completing lecture")
                     self.complete_lecture()
                 except Exception as e:
+                    if self.is_dead_session_error(e):
+                        raise
                     logger.warning(
                         "Could not complete lecture: "
                         + video["title"]
@@ -1126,10 +1158,12 @@ class TeachableDownloader:
                     logger.info(
                         "Downloading attachment: " + filename + " for video: " + title
                     )
-                    # Download file and save the file in output_path directory
+                    # Download file and save the file in output_path directory;
+                    # wget treats out as a file name unless the folder already exists
+                    os.makedirs(output_path, exist_ok=True)
                     wget.download(link, out=output_path)
         else:
-            logger.warning("No attachments found for video: " + title)
+            logger.info("No attachments found for video: " + title)
 
         # Grab the video attachments type pdf_embed
         pdf_attachments = self.driver.find_elements(
@@ -1156,7 +1190,7 @@ class TeachableDownloader:
                     output_path, lambda: pdf_link.click(), pdf_filename
                 )
         else:
-            logger.warning("No PDF attachments found for video: " + title)
+            logger.info("No PDF attachments found for video: " + title)
 
         # Grab audio attachments (the mp3 player widget), whose actual file
         # URL sits in the button's data-href rather than an <a href>.
@@ -1276,7 +1310,7 @@ class TeachableDownloader:
                         urlparse(unquote(image_link)).path
                     )
                     if not image_filename:
-                        image_filename = f"image_{idx}.jpg"
+                        image_filename = f"image-{idx}.png"
                     if os.path.isfile(os.path.join(output_path, image_filename)):
                         logger.info("Skipping existing image: " + image_filename)
                         continue
@@ -1347,10 +1381,9 @@ class TeachableDownloader:
         video_title = f"{video_index:02d}-{title}"
 
         # The extension isn't known until download, so match on the title with video extensions
-        video_extensions = ("mp4", "mkv", "webm", "mov", "avi", "m4v")
         existing_video_files = [
             f
-            for ext in video_extensions
+            for ext in VIDEO_EXTENSIONS
             for f in glob.glob(
                 os.path.join(
                     glob.escape(output_path), glob.escape(video_title) + "." + ext
@@ -1379,6 +1412,8 @@ class TeachableDownloader:
             trigger_download=lambda: video_link.click(),
             timeout=timeout,
         )
+        if not latest_file:
+            return False
 
         # Determine the file extension
         _, extension = os.path.splitext(latest_file)
@@ -1536,7 +1571,7 @@ class TeachableDownloader:
             # Check for timeout
             if timeout != -1 and (time.time() - start_time) > timeout:
                 logger.error("Download timed out.")
-                return None
+                return False
 
             time.sleep(1)
 
@@ -1692,7 +1727,11 @@ if __name__ == "__main__":
         verbose = True
         log_level = logging.DEBUG
 
-    logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
+    # force=True: on some Python builds hashlib installs a root handler at startup,
+    # which makes a plain basicConfig() silently do nothing
+    logging.basicConfig(
+        level=log_level, format="%(levelname)s: %(message)s", force=True
+    )
 
     if not check_required_args(args):
         logger.error(
