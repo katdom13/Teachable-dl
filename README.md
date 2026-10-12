@@ -195,7 +195,10 @@ python3 main.py --url <course_url> --manual-login --only-chapter "Speaking Tips"
 
 > `--start-chapter` downloads from that chapter to the end of the course, `--only-chapter` downloads just that chapter. They can't be used together or with `--file`.
 
-If the course's chapter order changes, existing chapter folders are reused by title. To also rename them to the new numbers, without downloading anything, run
+Rerunning a course only downloads what's missing. Each course folder has a `course.json` that records where every
+lecture was saved, by the lecture's ID, so lectures and chapters that are reordered or renamed in the course are still
+found. Courses downloaded before `course.json` existed are matched by title on their first rerun. To rename existing
+folders and files to the course's current order and titles, without downloading anything, run
 
 ```sh
 python3 main.py --url <course_url> --manual-login --renumber-only

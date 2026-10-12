@@ -9,6 +9,7 @@ import re
 import string
 import sys
 import time
+from collections import Counter
 from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 import requests
@@ -26,6 +27,9 @@ logger = logging.getLogger(__name__)
 VIDEO_EXTENSIONS = ("mp4", "mkv", "webm", "mov", "avi", "m4v")
 
 BATCH_FILE_FIELDS = ("url", "email", "password", "login_url")
+
+# Saved in each course folder: where every downloaded lecture's files are, by lecture ID
+COURSE_INDEX_FILENAME = "course.json"
 
 # Elements that download_videos_from_links() downloads from on a lecture page
 LECTURE_CONTENT_SELECTOR = (
@@ -142,8 +146,39 @@ def chapter_matches(video, query):
     # cleaned the same way so "Speaking Tips" matches "03-Speaking-Tips"
     if query.isdigit():
         return video["chapter_idx"] == int(query)
-    chapter = os.path.basename(video["download_path"])
+    chapter = os.path.basename(video["chapter_path"])
     return clean_string(query).lower() in chapter.lower()
+
+
+def lecture_id(link):
+    # Lecture URLs end in /lectures/<id>, which stays the same when the course is reordered
+    path = urlparse(link or "").path
+    match = re.search(r"/lectures/(\d+)", path)
+    return match.group(1) if match else path
+
+
+def lecture_files(folder, name):
+    # A lecture's html snapshot, videos (name[-n].ext), subtitles (name[-n].lang.ext)
+    # and attachment folder (name)
+    if not os.path.isdir(folder):
+        return []
+    pattern = re.compile(rf"{re.escape(name)}((-\d+)?(\.[^.]+)?\.[^.]+)?")
+    return [f for f in os.listdir(folder) if pattern.fullmatch(f)]
+
+
+def find_saved_lecture_idx(folder, title, idx, claimed):
+    # For lectures saved before the course index existed: the number of an unclaimed
+    # snapshot with this title, preferring the current one
+    if not os.path.isdir(folder):
+        return None
+    pattern = re.compile(rf"(\d+)-{re.escape(title)}\.html")
+    numbers = [
+        int(match.group(1))
+        for f in os.listdir(folder)
+        if (match := pattern.fullmatch(f))
+        and (folder, f.removesuffix(".html")) not in claimed
+    ]
+    return min(numbers, key=lambda n: (n != idx, n)) if numbers else None
 
 
 class TeachableDownloader:
@@ -180,6 +215,8 @@ class TeachableDownloader:
         self.renumber_only = renumber_only_arg
         # Chapter folders already given to a chapter of the current course
         self.used_chapter_paths = set()
+        self.course_index = {}
+        self.course_index_path = None
 
     # --- Helpers ---
 
@@ -593,6 +630,7 @@ class TeachableDownloader:
         course_path = create_folder(
             self.get_course_title(course_url, title_by, title_selector)
         )
+        self.load_course_index(course_path)
         if not self.renumber_only:
             self.try_step(
                 "save course html",
@@ -601,6 +639,124 @@ class TeachableDownloader:
                 level=logging.ERROR,
             )
         return course_path
+
+    # --- Course index ---
+
+    def load_course_index(self, course_path):
+        self.course_index_path = os.path.join(course_path, COURSE_INDEX_FILENAME)
+        try:
+            with open(self.course_index_path, encoding="utf-8") as f:
+                self.course_index = json.load(f)["lectures"]
+        except FileNotFoundError:
+            self.course_index = {}
+        except (OSError, ValueError, KeyError) as e:
+            logger.warning(
+                f"Could not read {COURSE_INDEX_FILENAME}, starting a new one: {e}"
+            )
+            self.course_index = {}
+
+    def save_course_index(self):
+        content = json.dumps({"lectures": self.course_index}, indent=2)
+        write_file(self.course_index_path, content.encode("utf-8"))
+
+    def record_lecture(self, video):
+        self.course_index[video["id"]] = {
+            "chapter": os.path.basename(video["download_path"]),
+            "idx": video["idx"],
+            "title": video["title"],
+        }
+
+    def indexed_chapter_folder(self, course_path, links):
+        # The folder holding most of this chapter's saved lectures, if any
+        folders = [
+            path
+            for link in links
+            if (entry := self.course_index.get(lecture_id(link)))
+            and os.path.isdir(path := os.path.join(course_path, entry["chapter"]))
+            and path not in self.used_chapter_paths
+        ]
+        return Counter(folders).most_common(1)[0][0] if folders else None
+
+    def rename_indexed_chapter(self, old_path, new_path):
+        old, new = os.path.basename(old_path), os.path.basename(new_path)
+        for entry in self.course_index.values():
+            if entry["chapter"] == old:
+                entry["chapter"] = new
+
+    def place_lectures(self, video_list):
+        # Points each lecture at its saved files, or with --renumber-only moves them to
+        # the lecture's current position
+        course_path = os.path.dirname(self.course_index_path)
+        claimed = set()
+        placed = {}
+
+        # Lectures in the course index keep the files they were saved to
+        for i, video in enumerate(video_list):
+            if entry := self.course_index.get(video["id"]):
+                folder = os.path.join(course_path, entry["chapter"])
+                key = (folder, lecture_name(entry["idx"], entry["title"]))
+                if key not in claimed:
+                    claimed.add(key)
+                    placed[i] = (folder, entry["idx"], entry["title"])
+
+        # Others reuse a snapshot saved before the index existed, or the next free number
+        for i, video in enumerate(video_list):
+            if i in placed:
+                continue
+            folder, title = video["chapter_path"], video["title"]
+            idx = find_saved_lecture_idx(folder, title, video["idx"], claimed)
+            idx = idx or video["idx"]
+            while (folder, lecture_name(idx, title)) in claimed:
+                idx += 1
+            claimed.add((folder, lecture_name(idx, title)))
+            placed[i] = (folder, idx, title)
+
+        for i, video in enumerate(video_list):
+            target = (video["chapter_path"], video["idx"], video["title"])
+            video["download_path"], video["idx"], video["title"] = placed[i]
+            if not self.renumber_only:
+                continue
+            if not lecture_files(
+                video["download_path"], lecture_name(video["idx"], video["title"])
+            ):
+                # Nothing saved yet, so it gets its current position next time
+                self.course_index.pop(video["id"], None)
+                continue
+            if placed[i] != target:
+                self.move_lecture(video, *target)
+            self.record_lecture(video)
+
+        if self.renumber_only:
+            self.save_course_index()
+        return video_list
+
+    def move_lecture(self, video, folder, idx, title):
+        old_folder = video["download_path"]
+        old_name = lecture_name(video["idx"], video["title"])
+        new_name = lecture_name(idx, title)
+        files = lecture_files(old_folder, old_name)
+        if not files:
+            return
+        if any(
+            os.path.exists(os.path.join(folder, new_name + f[len(old_name) :]))
+            for f in files
+        ):
+            logger.warning(f"Cannot renumber {old_name}: {new_name} already exists")
+            return
+
+        logger.info(
+            f"Renumbering lecture: {os.path.basename(old_folder)}/{old_name} -> "
+            f"{os.path.basename(folder)}/{new_name}"
+        )
+        os.makedirs(folder, exist_ok=True)
+        for f in files:
+            os.rename(
+                os.path.join(old_folder, f),
+                os.path.join(folder, new_name + f[len(old_name) :]),
+            )
+        video["download_path"], video["idx"], video["title"] = folder, idx, title
+
+    # --- Chapters ---
 
     def wait_for_sections(self, selector):
         try:
@@ -654,20 +810,20 @@ class TeachableDownloader:
     def add_chapter(
         self, video_list, course_path, chapter_idx, chapter_title, lectures
     ):
-        # The chapter folder is created lazily in download_videos_from_links, once a
-        # lecture is actually about to be written into it
+        # Lists lectures at their current position (place_lectures() then points them at
+        # saved files); folders are only created once a lecture is downloaded
         chapter_title = clean_string(chapter_title)
-        download_path = self.resolve_chapter_folder(
-            course_path, chapter_idx, chapter_title
-        )
+        chapter_path = self.indexed_chapter_folder(
+            course_path, [link for link, _ in lectures]
+        ) or self.resolve_chapter_folder(course_path, chapter_idx, chapter_title)
         if self.renumber_only:
-            download_path = self.renumber_chapter_folder(
-                download_path, chapter_idx, chapter_title
+            old_path = chapter_path
+            chapter_path = self.renumber_chapter_folder(
+                chapter_path, chapter_idx, chapter_title
             )
-        self.used_chapter_paths.add(download_path)
-        logger.info(f"Found chapter: {os.path.basename(download_path)}")
-        if self.renumber_only:
-            return
+            self.rename_indexed_chapter(old_path, chapter_path)
+        self.used_chapter_paths.add(chapter_path)
+        logger.info(f"Found chapter: {os.path.basename(chapter_path)}")
 
         for idx, (link, title) in enumerate(lectures, start=1):
             title = truncate_title_to_fit_filename(clean_string(title))
@@ -675,8 +831,10 @@ class TeachableDownloader:
             video_list.append(
                 {
                     "link": link,
+                    "id": lecture_id(link),
                     "title": title,
-                    "download_path": download_path,
+                    "chapter_path": chapter_path,
+                    "download_path": chapter_path,
                     "chapter_idx": chapter_idx,
                     "idx": idx,
                 }
@@ -918,17 +1076,18 @@ class TeachableDownloader:
         )
         if first is None:
             chapters = dict.fromkeys(
-                os.path.basename(v["download_path"]) for v in video_list
+                os.path.basename(v["chapter_path"]) for v in video_list
             )
             logger.error(
                 f"No chapter matches '{query}', nothing downloaded. Chapters: {', '.join(chapters)}"
             )
             return []
 
-        chapter_path = video_list[first]["download_path"]
+        chapter_path = video_list[first]["chapter_path"]
         if self.only_chapter:
             logger.info(f"Downloading only chapter: {os.path.basename(chapter_path)}")
-            return [v for v in video_list if v["download_path"] == chapter_path]
+            chapter_idx = video_list[first]["chapter_idx"]
+            return [v for v in video_list if v["chapter_idx"] == chapter_idx]
         logger.info(f"Starting from chapter: {os.path.basename(chapter_path)}")
         return video_list[first:]
 
@@ -941,11 +1100,19 @@ class TeachableDownloader:
             logger.warning(f"No attachments or video found for lecture: {title}")
 
     def download_videos_from_links(self, video_list):
+        video_list = self.place_lectures(video_list)
+        if self.renumber_only:
+            return
+
         for video in self.filter_chapters(video_list):
             link = video["link"]
             title = video["title"]
             download_path = video["download_path"]
             idx = video["idx"]
+
+            # Recorded before downloading, so an interrupted lecture resumes in the same place
+            self.record_lecture(video)
+            self.try_step("save course index", self.save_course_index)
 
             if self.is_lecture_already_saved(video):
                 logger.info(f"Skipping already saved lecture: {title}")
