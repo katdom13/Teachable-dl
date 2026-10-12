@@ -133,6 +133,10 @@ def audio_attachment_filename(name, href):
     return (name or "").strip() or os.path.basename(urlparse(href).path)
 
 
+def chapter_folder_name(chapter_idx, chapter_title):
+    return f"{chapter_idx:02d}-{chapter_title}"
+
+
 def chapter_matches(video, query):
     # A number picks the chapter by position; text matches part of the folder name,
     # cleaned the same way so "Speaking Tips" matches "03-Speaking-Tips"
@@ -153,6 +157,7 @@ class TeachableDownloader:
         timeout_arg=10,
         start_chapter_arg=None,
         only_chapter_arg=None,
+        renumber_only_arg=False,
     ):
         # external_pdf: download PDFs instead of opening them in Chrome's viewer
         self.driver = Driver(uc=True, headed=True, external_pdf=True)
@@ -172,6 +177,9 @@ class TeachableDownloader:
         self.global_timeout = timeout_arg
         self.start_chapter = start_chapter_arg
         self.only_chapter = only_chapter_arg
+        self.renumber_only = renumber_only_arg
+        # Chapter folders already given to a chapter of the current course
+        self.used_chapter_paths = set()
 
     # --- Helpers ---
 
@@ -581,15 +589,17 @@ class TeachableDownloader:
             )
 
     def prepare_course(self, course_url, title_by, title_selector):
+        self.used_chapter_paths = set()
         course_path = create_folder(
             self.get_course_title(course_url, title_by, title_selector)
         )
-        self.try_step(
-            "save course html",
-            self.save_page_html,
-            os.path.join(course_path, "course.html"),
-            level=logging.ERROR,
-        )
+        if not self.renumber_only:
+            self.try_step(
+                "save course html",
+                self.save_page_html,
+                os.path.join(course_path, "course.html"),
+                level=logging.ERROR,
+            )
         return course_path
 
     def wait_for_sections(self, selector):
@@ -601,15 +611,64 @@ class TeachableDownloader:
             logger.warning(f"No chapters found ({selector})")
             return []
 
+    def resolve_chapter_folder(self, course_path, chapter_idx, chapter_title):
+        # If the course's chapter order changed since the last run, reuse the folder with
+        # the same title under its old number instead of starting a new one
+        fresh_path = os.path.join(
+            course_path, chapter_folder_name(chapter_idx, chapter_title)
+        )
+        if os.path.isdir(fresh_path) or not os.path.isdir(course_path):
+            return fresh_path
+
+        for existing in sorted(os.listdir(course_path)):
+            path = os.path.join(course_path, existing)
+            if (
+                os.path.isdir(path)
+                and re.sub(r"^\d+-", "", existing) == chapter_title
+                # Chapters can share a title; give each its own folder
+                and path not in self.used_chapter_paths
+            ):
+                logger.debug(f"Reusing chapter folder {existing} for {chapter_title}")
+                return path
+        return fresh_path
+
+    def renumber_chapter_folder(self, download_path, chapter_idx, chapter_title):
+        # Returns the folder's path after renaming it to the chapter's current number
+        correct_path = os.path.join(
+            os.path.dirname(download_path),
+            chapter_folder_name(chapter_idx, chapter_title),
+        )
+        if download_path == correct_path or not os.path.isdir(download_path):
+            return download_path
+        if os.path.exists(correct_path):
+            logger.warning(
+                f"Cannot renumber {os.path.basename(download_path)}: {os.path.basename(correct_path)} already exists"
+            )
+            return download_path
+        logger.info(
+            f"Renumbering chapter folder: {os.path.basename(download_path)} -> {os.path.basename(correct_path)}"
+        )
+        os.rename(download_path, correct_path)
+        return correct_path
+
     def add_chapter(
         self, video_list, course_path, chapter_idx, chapter_title, lectures
     ):
         # The chapter folder is created lazily in download_videos_from_links, once a
         # lecture is actually about to be written into it
-        download_path = os.path.join(
-            course_path, f"{chapter_idx:02d}-{clean_string(chapter_title)}"
+        chapter_title = clean_string(chapter_title)
+        download_path = self.resolve_chapter_folder(
+            course_path, chapter_idx, chapter_title
         )
+        if self.renumber_only:
+            download_path = self.renumber_chapter_folder(
+                download_path, chapter_idx, chapter_title
+            )
+        self.used_chapter_paths.add(download_path)
         logger.info(f"Found chapter: {os.path.basename(download_path)}")
+        if self.renumber_only:
+            return
+
         for idx, (link, title) in enumerate(lectures, start=1):
             title = truncate_title_to_fit_filename(clean_string(title))
             logger.info(f"Found lecture: {title}")
@@ -721,6 +780,8 @@ class TeachableDownloader:
         return clean_string(course_title)
 
     def get_course_image(self, course_path, by, selector):
+        if self.renumber_only:
+            return
         image_elements = self.driver.find_elements(by, selector)
         if not image_elements:
             logger.warning("No course image element found")
@@ -1449,6 +1510,13 @@ if __name__ == "__main__":
     )
     chapter_group = parser.add_mutually_exclusive_group()
     chapter_group.add_argument(
+        "--renumber-only",
+        action="store_true",
+        default=False,
+        help="Rename existing chapter folders to match the course's current chapter order, "
+        "without downloading anything",
+    )
+    chapter_group.add_argument(
         "--start-chapter",
         help="Start from the first chapter matching this number or text "
         '(e.g. 3 or "Speaking Tips") and continue to the end of the course',
@@ -1484,6 +1552,7 @@ if __name__ == "__main__":
         timeout_arg=args.timeout,
         start_chapter_arg=args.start_chapter,
         only_chapter_arg=args.only_chapter,
+        renumber_only_arg=args.renumber_only,
     )
     exit_code = 0
     try:

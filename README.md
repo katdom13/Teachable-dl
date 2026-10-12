@@ -195,6 +195,12 @@ python3 main.py --url <course_url> --manual-login --only-chapter "Speaking Tips"
 
 > `--start-chapter` downloads from that chapter to the end of the course, `--only-chapter` downloads just that chapter. They can't be used together or with `--file`.
 
+If the course's chapter order changes, existing chapter folders are reused by title. To also rename them to the new numbers, without downloading anything, run
+
+```sh
+python3 main.py --url <course_url> --manual-login --renumber-only
+```
+
 or download several courses from a file
 
 ```sh
