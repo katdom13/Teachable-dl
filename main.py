@@ -17,7 +17,10 @@ import selenium.webdriver.support.expected_conditions as EC
 import wget
 import yt_dlp
 from selenium.common import TimeoutException
-from selenium.common.exceptions import InvalidSessionIdException
+from selenium.common.exceptions import (
+    InvalidSessionIdException,
+    StaleElementReferenceException,
+)
 from selenium.webdriver.remote.webdriver import By
 from selenium.webdriver.support.wait import WebDriverWait
 from seleniumbase import Driver
@@ -1166,32 +1169,24 @@ class TeachableDownloader:
         return widgets or self.driver.find_elements(By.XPATH, f"//{EMBED_PLAYER_XPATH}")
 
     def download_video_widgets(self, link, title, idx, download_path):
-        # Iterate the widgets and wait for each one's iframe individually as each video widget
-        # mounts its embed-player iframe asynchronously via JS after the page loads
-        video_widgets = self.find_video_widgets()
-        total_widgets = len(video_widgets)
-        for i, widget in enumerate(video_widgets):
-            current_widget = widget
-            # Signed video links are created when the page loads and expire after a while.
-            # On lectures with many videos, later links can expire (403) before we reach
-            # them, so reload the page for fresh links and retry once.
+        # Each video widget mounts its player iframe via JS once it's scrolled into view
+        total_widgets = len(self.find_video_widgets())
+        for i in range(total_widgets):
+            # On lectures with many videos, later players can be slow to mount and their
+            # signed links can expire before we reach them, so reload and retry once
             for attempt_num in range(2):
                 try:
                     if attempt_num > 0:
                         logger.info(
-                            f"Video {i + 1}/{total_widgets} failed, likely an expired link — reloading the page and retrying once"
+                            f"Video {i + 1}/{total_widgets} failed, reloading the page and retrying once"
                         )
                         self.open_lecture(link, title)
-                        refreshed_widgets = self.find_video_widgets()
-                        if i >= len(refreshed_widgets):
-                            logger.warning(
-                                f"Widget {i + 1}/{total_widgets} no longer found after reload; giving up on it"
-                            )
-                            break
-                        current_widget = refreshed_widgets[i]
+                        # Scroll through like a reader would; jumping straight to a widget
+                        # far down the page may not mount its player
+                        self.scroll_page_to_trigger_lazy_content()
 
                     if self.download_video_widget(
-                        current_widget, i, total_widgets, title, idx, download_path
+                        i, total_widgets, title, idx, download_path
                     ):
                         break
                 except Exception as e:
@@ -1204,25 +1199,39 @@ class TeachableDownloader:
                     self.driver.switch_to.default_content()
 
     def download_video_widget(
-        self, widget, widget_index, total_widgets, title, idx, download_path
+        self, widget_index, total_widgets, title, idx, download_path
     ):
+        # Look the widget up by position each time: a reload or re-render replaces every
+        # element on the page, so a widget found earlier can be stale
+        def current_widget():
+            widgets = self.find_video_widgets()
+            if widget_index >= len(widgets):
+                raise RuntimeError(
+                    f"video {widget_index + 1}/{total_widgets} is no longer on the page"
+                )
+            return widgets[widget_index]
+
+        def mounted_player(_):
+            # descendant-or-self: a widget may be the iframe itself (see find_video_widgets)
+            return current_widget().find_elements(
+                By.XPATH, f"descendant-or-self::{EMBED_PLAYER_XPATH}"
+            )
+
         # Later widgets can take much longer to mount their iframe, so wait well past
         # global_timeout. Scroll once, then poll: re-scrolling can reset the lazy-loader's
         # visibility timer and stop the widget from mounting at all.
         self.driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'});", widget
+            "arguments[0].scrollIntoView({block: 'center'});", current_widget()
         )
 
         max_wait_seconds = max(self.global_timeout * 3, 30)
         try:
-            # descendant-or-self: a widget may be the iframe itself (see find_video_widgets)
             frames = WebDriverWait(
-                self.driver, max_wait_seconds, poll_frequency=1
-            ).until(
-                lambda _: widget.find_elements(
-                    By.XPATH, f"descendant-or-self::{EMBED_PLAYER_XPATH}"
-                )
-            )
+                self.driver,
+                max_wait_seconds,
+                poll_frequency=1,
+                ignored_exceptions=[StaleElementReferenceException],
+            ).until(mounted_player)
         except TimeoutException:
             raise TimeoutException(
                 f"video {widget_index + 1}/{total_widgets} never mounted its player within {max_wait_seconds}s"
