@@ -1201,6 +1201,12 @@ class TeachableDownloader:
     def download_video_widget(
         self, widget_index, total_widgets, title, idx, download_path
     ):
+        video_title = widget_video_title(title, widget_index, total_widgets)
+        name = lecture_name(idx, video_title)
+        if find_existing_video(download_path, name):
+            logger.info(f"Skipping existing video: {name}")
+            return True
+
         # Look the widget up by position each time: a reload or re-render replaces every
         # element on the page, so a widget found earlier can be stale
         def current_widget():
@@ -1243,12 +1249,18 @@ class TeachableDownloader:
         # Lazy-loaded iframes may not have rendered the video data
         # yet, so wait for it rather than failing immediately.
         script_text = self.wait_for(By.ID, "__NEXT_DATA__")
+        # The player's signed link expires a while after the player loads, which can be long
+        # before we get to it, so reload the player for a fresh one
+        self.driver.execute_script("location.reload()")
+        WebDriverWait(self.driver, self.global_timeout).until(
+            EC.staleness_of(script_text)
+        )
+        script_text = self.wait_for(By.ID, "__NEXT_DATA__")
         json_text = json.loads(script_text.get_attribute("innerHTML"))
         link = json_text["props"]["pageProps"]["applicationData"]["mediaAssets"][0][
             "urlEncrypted"
         ]
 
-        video_title = widget_video_title(title, widget_index, total_widgets)
         self.try_step(
             f"download subtitle for {video_title}",
             self.download_subtitle,
