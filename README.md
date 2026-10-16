@@ -98,12 +98,6 @@ python3 -m pip install -U yt-dlp
 sudo apt install ffmpeg
 ```
 
-- wget
-
-```sh
-sudo apt install wget
-```
-
 - Chrome
 
 ```sh

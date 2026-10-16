@@ -10,11 +10,10 @@ import string
 import sys
 import time
 from collections import Counter
-from urllib.parse import unquote, urljoin, urlparse, urlunparse
+from urllib.parse import unquote, unquote_plus, urljoin, urlparse, urlunparse
 
 import requests
 import selenium.webdriver.support.expected_conditions as EC
-import wget
 import yt_dlp
 from selenium.common import TimeoutException
 from selenium.common.exceptions import (
@@ -134,6 +133,11 @@ def image_download_target(image_index, loader_src, src):
         return None, None, None
     ext = match.group(1).replace("jpeg", "jpg")
     return f"image-{image_index}.{ext}", None, match.group(2)
+
+
+def file_attachment_filename(href):
+    # The URL's decoded file name (%28 -> "(", + -> " "), as wget saved files before
+    return unquote_plus(os.path.basename(urlparse(href).path))
 
 
 def audio_attachment_filename(name, href):
@@ -1004,15 +1008,15 @@ class TeachableDownloader:
 
         attachment_path = os.path.join(output_path, name)
 
-        # File-type attachments (downloaded via wget). A lecture can have
-        # more than one separate file-attachment block.
+        # File-type attachments. A lecture can have more than one separate
+        # file-attachment block.
         for file_block in re.finditer(
             r'lecture-attachment-type-file["\'][^>]*>(.*?)</div>\s*</div>',
             content,
             re.DOTALL,
         ):
             for href in re.findall(r'href="([^"]+)"', file_block.group(1)):
-                filename = os.path.basename(urlparse(href).path)
+                filename = file_attachment_filename(href)
                 if filename and not os.path.isfile(
                     os.path.join(attachment_path, filename)
                 ):
@@ -1311,17 +1315,10 @@ class TeachableDownloader:
 
         for link in links:
             href = link.get_attribute("href")
-            # wget names the file after the URL, not the link text, so
-            # check against that to detect an already-downloaded file.
-            url_filename = os.path.basename(urlparse(href).path)
-            if url_filename and skip_existing(
-                os.path.join(output_path, url_filename), "attachment"
-            ):
+            filename = file_attachment_filename(href)
+            if not filename:
                 continue
-            logger.info(f"Downloading attachment: {link.text} for video: {title}")
-            # wget treats out as a file name unless the folder already exists
-            os.makedirs(output_path, exist_ok=True)
-            wget.download(href, out=output_path)
+            self.download_file(href, os.path.join(output_path, filename), "attachment")
 
     def download_pdf_attachments(self, output_path, title):
         blocks = self.driver.find_elements(
